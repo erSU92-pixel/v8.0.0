@@ -45,7 +45,6 @@ jobs:
           if [ -n "$MISSING" ]; then
             echo ""
             echo "❌ MISSING FILES:$MISSING"
-            echo "Push these files to the repo before running."
             exit 1
           fi
 
@@ -57,10 +56,8 @@ jobs:
               from bot import main, is_holiday, is_market_open, VERSION
               from news_calendar import NewsResult, check_news_guard
               from fuzzy_regime import membership, blend_params, dominant
-              from kelly import kelly_fraction
-              from supabase_client import SUPABASE
-              from outcome_tracker import process_open_signals
-              from circuit_breaker import consecutive_losses, risk_multiplier
+              from kelly import kelly_fraction, risk_pct_from_env
+              from supabase_client import SUPABASE, try_insert_signal
               print(f'✅ All imports OK (v{VERSION})')
               print(f'   Supabase enabled: {SUPABASE.enabled}')
           except Exception as e:
