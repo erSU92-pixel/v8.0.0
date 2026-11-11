@@ -30,6 +30,44 @@ jobs:
       - name: Install dependencies
         run: pip install --no-cache-dir --quiet -r requirements.txt
 
+      - name: Verify required files
+        run: |
+          MISSING=""
+          for f in bot.py optimizer.py news_calendar.py fuzzy_regime.py \
+                   kelly.py supabase_client.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "❌ MISSING: $f"
+              MISSING="$MISSING $f"
+            else
+              echo "✅ $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ MISSING FILES:$MISSING"
+            echo "Push these files to the repo before running."
+            exit 1
+          fi
+
+      - name: Verify imports
+        run: |
+          python -c "
+          import sys
+          try:
+              from bot import main, is_holiday, is_market_open, VERSION
+              from news_calendar import NewsResult, check_news_guard
+              from fuzzy_regime import membership, blend_params, dominant
+              from kelly import kelly_fraction
+              from supabase_client import SUPABASE
+              from outcome_tracker import process_open_signals
+              from circuit_breaker import consecutive_losses, risk_multiplier
+              print(f'✅ All imports OK (v{VERSION})')
+              print(f'   Supabase enabled: {SUPABASE.enabled}')
+          except Exception as e:
+              print(f'❌ Import failed: {type(e).__name__}: {e}')
+              sys.exit(1)
+          "
+
       - name: Restore persistent cache (SQLite audit DB + news cache)
         uses: actions/cache/restore@v4
         with:
@@ -39,9 +77,6 @@ jobs:
           key: bot-cache-${{ github.run_id }}
           restore-keys: |
             bot-cache-
-
-      - name: Verify files and imports
-        run: python verify.py
 
       - name: Run signal bot
         env:
