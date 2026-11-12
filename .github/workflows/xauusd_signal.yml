@@ -15,7 +15,7 @@ permissions:
 jobs:
   signal:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10  # Dinaikkan karena MetaApi butuh waktu connect
 
     steps:
       - name: Checkout repository
@@ -64,7 +64,7 @@ jobs:
               sys.exit(1)
           "
 
-      - name: Restore persistent cache (SQLite audit DB + news cache)
+      - name: Restore persistent cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -81,19 +81,18 @@ jobs:
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY:         ${{ secrets.SUPABASE_KEY }}
+          
           ACCOUNT_SIZE_USD:     ${{ vars.ACCOUNT_SIZE_USD || '1000' }}
           RISK_PCT:             ${{ vars.RISK_PCT || '1.0' }}
           MAX_LOT_RISK_PCT:     ${{ vars.MAX_LOT_RISK_PCT || '2.5' }}
-          KELLY_FRACTION:       ${{ vars.KELLY_FRACTION || '0.5' }}
-          KELLY_CAP_PCT:        ${{ vars.KELLY_CAP_PCT || '3.0' }}
-          DAILY_DD_LIMIT_R:     ${{ vars.DAILY_DD_LIMIT_R || '2.0' }}
-          DAILY_DD_DERISK_R:    ${{ vars.DAILY_DD_DERISK_R || '1.0' }}
-          DAILY_DD_DERISK_MULT: ${{ vars.DAILY_DD_DERISK_MULT || '0.5' }}
-          CB_HALT_CONSECUTIVE:  ${{ vars.CB_HALT_CONSECUTIVE || '3' }}
-          NEWS_ENABLED:         ${{ vars.NEWS_ENABLED || '1' }}
-          NOTIFY_WAIT:          ${{ vars.NOTIFY_WAIT || '0' }}
-          NOTIFY_SKIP:          ${{ vars.NOTIFY_SKIP || '0' }}
-          NOTIFY_HALT:          ${{ vars.NOTIFY_HALT || '0' }}
+          
+          # === METAAPI VARIABEL ===
+          EXECUTE_TRADES:       ${{ vars.EXECUTE_TRADES || '0' }}
+          METAAPI_TOKEN:        ${{ secrets.METAAPI_TOKEN }}
+          MT5_LOGIN:            ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD:         ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER:           ${{ secrets.MT5_SERVER }}
+          MT5_SYMBOL:           ${{ vars.MT5_SYMBOL || 'XAUUSD' }}
         run: python bot.py
 
       - name: Save persistent cache
