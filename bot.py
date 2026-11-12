@@ -1,13 +1,13 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.3.0 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.3.1 PRODUCTION
 ================================================================
-Changes v9.2.1 → v9.3.0:
-  [EXECUTION] Integrated MetaApi SDK for FULLY AUTOMATED TRADING.
-  [EXECUTION] Added `MetaApiExecutionEngine` class. Connects to MT5 cloud,
-              provisions account if needed, and fires market orders.
-  [SAFETY]    Requires `EXECUTE_TRADES=1` env var to actually fire. Default is 0.
-  [SAFETY]    Validates broker symbol via `MT5_SYMBOL` env (default XAUUSD).
-  [ROBUST]    Catches async loop errors gracefully if MetaApi connection fails.
+Changes v9.3.0 → v9.3.1:
+  [FIX]      Fixed TwelveData `.fillna()` crash on volume column.
+  [FIX]      YFinance validation now allows gaps (`allow_gap=True`).
+  [FIX]      Dukascopy fallback gracefully skips if `fetch` is missing.
+  [SAFETY]   Added DUMMY DATA GUARD: If source is "csv", auto-execution
+             is FORCE DISABLED to prevent executing trades at $2000
+             when real gold is at $3900+.
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.3.0"
+VERSION = "9.3.1"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -84,12 +84,10 @@ class BotConfig:
     macro_cache_min: int = 30
     news_enabled: bool = True
     
-    # Notification settings
     notify_wait: bool = False
     notify_skip: bool = False
     notify_halt: bool = False
 
-    # MetaApi Execution
     execute_trades: bool = False
     metaapi_token: Optional[str] = None
     mt5_login: Optional[str] = None
@@ -151,36 +149,26 @@ class BotConfig:
 
     def warnings(self) -> List[str]:
         w = []
-        if not self.twelve_data_api_key:
-            w.append("TWELVE_DATA_API_KEY missing → fallback to Dukascopy/Yahoo")
-        if not self.telegram_bot_token or not self.telegram_chat_id:
-            w.append("Telegram creds missing → stdout only")
-        if not SUPABASE.enabled:
-            w.append("Supabase disabled → SQLite-only")
+        if not self.twelve_data_api_key: w.append("TWELVE_DATA_API_KEY missing")
+        if not self.telegram_bot_token or not self.telegram_chat_id: w.append("Telegram creds missing")
+        if not SUPABASE.enabled: w.append("Supabase disabled")
         if self.execute_trades:
-            if not self.metaapi_token:
-                w.append("EXECUTE_TRADES=1 but METAAPI_TOKEN missing! Execution will fail.")
-            else:
-                w.append(f"⚠️ AUTO-EXECUTION ENABLED for {self.mt5_symbol} on {self.mt5_server}.")
-        if self.account_size_usd < 5000:
-            w.append(f"INFO: Account ${self.account_size_usd:.0f} — min lot risk capped at {self.max_lot_risk_pct}%.")
+            if not self.metaapi_token: w.append("EXECUTE_TRADES=1 but METAAPI_TOKEN missing!")
+            else: w.append(f"⚠️ AUTO-EXECUTION ENABLED for {self.mt5_symbol} on {self.mt5_server}.")
         return w
 
 
 # ============================================================================
-# 2. LOGGING
+# 2. LOGGING & UTILS
 # ============================================================================
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         p = {"ts": datetime.now(timezone.utc).isoformat(), "run_id": RUN_ID,
              "level": record.levelname, "msg": record.getMessage()}
         extra = getattr(record, "extra_data", None)
-        if isinstance(extra, dict):
-            p.update(extra)
-        if record.exc_info:
-            p["exc"] = self.formatException(record.exc_info)
+        if isinstance(extra, dict): p.update(extra)
+        if record.exc_info: p["exc"] = self.formatException(record.exc_info)
         return json.dumps(p, default=str)
-
 
 def get_logger(name: str = "xauusd") -> logging.Logger:
     lg = logging.getLogger(name)
@@ -192,9 +180,7 @@ def get_logger(name: str = "xauusd") -> logging.Logger:
         lg.propagate = False
     return lg
 
-
 LOG = get_logger()
-
 
 def log_event(level: int = logging.INFO, event: str = "", **kw: Any) -> None:
     rec = LOG.makeRecord(LOG.name, level, "", 0, event, (), None)
@@ -205,26 +191,16 @@ def log_event(level: int = logging.INFO, event: str = "", **kw: Any) -> None:
 # ============================================================================
 # 3. INDICATORS
 # ============================================================================
-def ema(s: pd.Series, p: int) -> pd.Series:
-    return s.ewm(span=p, adjust=False).mean()
-
-def sma(s: pd.Series, p: int) -> pd.Series:
-    return s.rolling(p, min_periods=p).mean()
-
+def ema(s: pd.Series, p: int) -> pd.Series: return s.ewm(span=p, adjust=False).mean()
+def sma(s: pd.Series, p: int) -> pd.Series: return s.rolling(p, min_periods=p).mean()
 def rsi(s: pd.Series, p: int = 14) -> pd.Series:
     d = s.diff()
     gain = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
     loss = -d.clip(upper=0).ewm(alpha=1 / p, adjust=False).mean()
     return 100.0 - 100.0 / (1.0 + gain / (loss + 1e-10))
-
 def atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift(1)).abs(),
-        (df["low"] - df["close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - df["close"].shift(1)).abs(), (df["low"] - df["close"].shift(1)).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / p, adjust=False).mean()
-
 def adx(df: pd.DataFrame, p: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
     up, dn = df["high"].diff(), -df["low"].diff()
     plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
@@ -234,10 +210,8 @@ def adx(df: pd.DataFrame, p: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]
     m_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / (tr + 1e-10)
     dx = 100 * (p_di - m_di).abs() / (p_di + m_di + 1e-10)
     return dx.ewm(alpha=1 / p, adjust=False).mean(), p_di, m_di
-
 def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
-    if df["volume"].sum() <= 0:
-        return float(df["close"].median())
+    if df["volume"].sum() <= 0: return float(df["close"].median())
     hist, edges = np.histogram(df["close"], bins=bins, weights=df["volume"])
     i = int(np.argmax(hist))
     return float((edges[i] + edges[i + 1]) / 2.0)
@@ -250,40 +224,17 @@ def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     weeks = calendar.monthcalendar(year, month)
     days = [w[weekday] for w in weeks if w[weekday] != 0]
     return date(year, month, days[n - 1] if n > 0 else days[n])
-
 def _easter(year: int) -> date:
-    a = year % 19
-    b, c = divmod(year, 100)
-    d, e = divmod(b, 4)
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = divmod(c, 4)
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
+    a = year % 19; b, c = divmod(year, 100); d, e = divmod(b, 4); f = (b + 8) // 25; g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30; i, k = divmod(c, 4); l = (32 + 2 * e + 2 * i - h - k) % 7; m = (a + 11 * h + 22 * l) // 451
     month, day = divmod(h + l - 7 * m + 114, 31)
     return date(year, month, day + 1)
-
 def _holiday_set(year: int) -> Set[date]:
-    h: Set[date] = {
-        date(year, 1, 1),
-        _nth_weekday(year, 1, 0, 3),
-        _nth_weekday(year, 2, 0, 3),
-        _easter(year) - timedelta(days=2),
-        _nth_weekday(year, 5, 0, -1),
-        date(year, 7, 4),
-        _nth_weekday(year, 9, 0, 1),
-        _nth_weekday(year, 11, 3, 4),
-        date(year, 12, 25),
-    }
+    h = {date(year, 1, 1), _nth_weekday(year, 1, 0, 3), _nth_weekday(year, 2, 0, 3), _easter(year) - timedelta(days=2), _nth_weekday(year, 5, 0, -1), date(year, 7, 4), _nth_weekday(year, 9, 0, 1), _nth_weekday(year, 11, 3, 4), date(year, 12, 25)}
     if year >= 2022: h.add(date(year, 6, 19))
     return h
-
 _HOLIDAYS: Dict[int, Set[date]] = {y: _holiday_set(y) for y in range(2024, 2031)}
-
-def is_holiday(d: date) -> bool:
-    return d in _HOLIDAYS.get(d.year, set())
-
+def is_holiday(d: date) -> bool: return d in _HOLIDAYS.get(d.year, set())
 def is_market_open(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     if is_holiday(now.date()): return False
@@ -292,11 +243,9 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
     if wd == 6: return h >= 22
     if wd == 4: return h < 21
     return True
-
 def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
     now = datetime.now(timezone.utc)
-    if not is_market_open(now):
-        return "CLOSED", False, 999.0, 1.0
+    if not is_market_open(now): return "CLOSED", False, 999.0, 1.0
     h = now.hour
     if 0 <= h < 7:   return "ASIA_RANGE",   True, 65.0, 1.0
     if 7 <= h < 12:  return "LONDON_TREND", True, 70.0, 1.3
@@ -308,10 +257,7 @@ def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
 # ============================================================================
 # 5. DATA QUALITY
 # ============================================================================
-def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
-                   allow_gap: bool = False,
-                   max_stale_market_h: float = 1.5,
-                   max_stale_off_h: float = 72.0) -> None:
+def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool = False, max_stale_market_h: float = 1.5, max_stale_off_h: float = 72.0) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
     miss = req - set(df.columns)
     if miss: raise ValueError(f"{label}: missing {miss}")
@@ -335,8 +281,7 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
     now = datetime.now(timezone.utc)
     age_h = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600
     max_age = max_stale_market_h if is_market_open(now) else max_stale_off_h
-    if age_h > max_age:
-        raise ValueError(f"{label}: stale {age_h:.2f}h (max {max_age}h)")
+    if age_h > max_age: raise ValueError(f"{label}: stale {age_h:.2f}h (max {max_age}h)")
 
 
 # ============================================================================
@@ -347,14 +292,7 @@ DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
     "WEAK_TREND": {"threshold": 70.0, "sl_mult": 1.5, "tp1_mult": 1.5, "tp2_mult": 2.5, "max_hold": 48.0},
     "RANGING":    {"threshold": 78.0, "sl_mult": 1.0, "tp1_mult": 1.0, "tp2_mult": 2.0, "max_hold": 24.0},
 }
-
-_PARAM_BOUNDS = {
-    "threshold": (50.0, 95.0),
-    "sl_mult":   (0.5, 3.0),
-    "tp1_mult":  (0.5, 5.0),
-    "tp2_mult":  (1.0, 8.0),
-    "max_hold":  (12.0, 168.0),
-}
+_PARAM_BOUNDS = {"threshold": (50.0, 95.0), "sl_mult": (0.5, 3.0), "tp1_mult": (0.5, 5.0), "tp2_mult": (1.0, 8.0), "max_hold": (12.0, 168.0)}
 
 def _validate_params(params: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
     for regime in REGIMES:
@@ -367,8 +305,7 @@ def _validate_params(params: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
 
 def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
     path = os.getenv("PARAMS_FILE", "params.json")
-    if not os.path.exists(path):
-        return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
+    if not os.path.exists(path): return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
     try:
         with open(path) as f: j = json.load(f)
         schema = int(j.get("schema", 1))
@@ -389,13 +326,11 @@ def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
 
 
 # ============================================================================
-# 7. MARKET DATA HANDLER
+# 7. MARKET DATA HANDLER (FIXED v9.3.1)
 # ============================================================================
 def _retry_session(retries: int, backoff: float) -> requests.Session:
     s = requests.Session()
-    r = Retry(total=retries, backoff_factor=backoff,
-              status_forcelist=[429, 500, 502, 503, 504],
-              allowed_methods=["GET"])
+    r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({"User-Agent": f"XAUUSD-Quant/{VERSION}"})
     return s
@@ -423,19 +358,31 @@ class MarketDataHandler:
             raise RuntimeError(j.get("message", "TwelveData error"))
         vals = j.get("values") or []
         if not vals: return None
+        
         df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            
+        # FIX BUG: .fillna() on float
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
+            
         return df.sort_values("time").reset_index(drop=True)
 
     def _dukascopy(self) -> Optional[MarketData]:
         if dukascopy_python is None: return None
         try:
             end = datetime.now(timezone.utc)
-            df_h1 = dukascopy_python.fetch(instrument="XAU/USD", interval="1HOUR", offer_side="BID", start=end - timedelta(days=30), end=end)
-            df_m15 = dukascopy_python.fetch(instrument="XAU/USD", interval="15MIN", offer_side="BID", start=end - timedelta(days=5), end=end)
+            # Wrap fetch in try-except to handle API mismatch safely
+            try:
+                df_h1 = dukascopy_python.fetch(instrument="XAU/USD", interval="1HOUR", offer_side="BID", start=end - timedelta(days=30), end=end)
+                df_m15 = dukascopy_python.fetch(instrument="XAU/USD", interval="15MIN", offer_side="BID", start=end - timedelta(days=5), end=end)
+            except AttributeError:
+                log_event(logging.WARNING, "dukascopy_api_mismatch", msg="library version does not support .fetch()")
+                return None
             
             if df_h1 is None or len(df_h1) < self.cfg.min_bars: return None
             df_h1 = df_h1.reset_index().rename(columns={"timestamp": "time"})
@@ -472,7 +419,7 @@ class MarketDataHandler:
             df = df.rename(columns={tcol: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
             df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
             for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0) if "volume" in df else 1000.0
             return df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
 
         h1 = norm(h1_raw)
@@ -529,8 +476,9 @@ class MarketDataHandler:
 
         try:
             md = self._yf()
-            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1")
-            validate_ohlcv(md.m15, 50, "yf-M15")
+            # FIX BUG: allow_gap=True for yfinance
+            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1", allow_gap=True)
+            validate_ohlcv(md.m15, 50, "yf-M15", allow_gap=True)
             return md
         except Exception as e:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
@@ -650,27 +598,19 @@ class SignalGenerator:
         self.params_source = params_source
 
     def _run_21_voters(self, df: pd.DataFrame) -> Tuple[float, int, int, Dict[str, int]]:
-        close = df["close"]
-        c = float(close.iloc[-1])
-        v: List[int] = []
-        dbg: Dict[str, int] = {}
-
+        close = df["close"]; c = float(close.iloc[-1]); v: List[int] = []; dbg: Dict[str, int] = {}
         sma_votes = [1 if c > sma(close, p).iloc[-1] else -1 for p in (5, 10, 20, 50, 100, 200)]
         v.extend(sma_votes); dbg["sma"] = sum(sma_votes)
-
         e1 = 1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1
         e2 = 1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1
         e3 = 1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1
         v.extend([e1, e2, e3]); dbg["ema"] = e1 + e2 + e3
-
         r = float(rsi(close, 14).iloc[-1])
         r_v = [1 if r > 50 else -1, 1 if r < 70 else -1, 1 if r > 30 else -1]
         v.extend(r_v); dbg["rsi"] = sum(r_v)
-
         adx_v, p_di, m_di = adx(df, 14)
         m_v = [1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_v.iloc[-1] > 20 else -1, 1 if c > close.iloc[-2] else -1, 1 if c > close.iloc[-5] else -1, 1 if c > close.iloc[-10] else -1]
         v.extend(m_v); dbg["momentum"] = sum(m_v)
-
         mp = 0
         for n in (5, 10):
             hi_n, lo_n = df["high"].iloc[-n:].max(), df["low"].iloc[-n:].min()
@@ -678,35 +618,21 @@ class SignalGenerator:
             vote = 1 if pos > 0.5 else -1
             v.append(vote); mp += vote
         dbg["micro"] = mp
-
         vol_v = 1 if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1] else -1
         v.append(vol_v); dbg["volume"] = vol_v
-
         poc = volume_profile_poc(df)
         poc_v = 1 if c > poc else -1
         v.append(poc_v); dbg["poc"] = poc_v
-
-        bull = sum(1 for x in v if x == 1)
-        bear = 21 - bull
+        bull = sum(1 for x in v if x == 1); bear = 21 - bull
         return max(bull, bear) / 21.0, bull, bear, dbg
 
     def generate(self, md: MarketData, news: NewsResult, macro: MacroCheck, cfg: BotConfig) -> EnsembleResult:
-        df, m15 = md.h1, md.m15
-        close = df["close"]
-        c_last = float(close.iloc[-1])
-        atr_val = float(atr(df, 14).iloc[-1])
-        adx_val = float(adx(df, 14)[0].iloc[-1])
-
-        weights = membership(adx_val)
-        dom = dominant(weights)
-        blended = blend_params(weights, self.params)
-        threshold = blended.get("threshold", 70.0)
-        atr_mult = blended.get("sl_mult", 1.5)
-
-        poc = volume_profile_poc(df)
-        session, allowed, _, _ = get_session_profile(cfg)
+        df, m15 = md.h1, md.m15; close = df["close"]; c_last = float(close.iloc[-1])
+        atr_val = float(atr(df, 14).iloc[-1]); adx_val = float(adx(df, 14)[0].iloc[-1])
+        weights = membership(adx_val); dom = dominant(weights); blended = blend_params(weights, self.params)
+        threshold = blended.get("threshold", 70.0); atr_mult = blended.get("sl_mult", 1.5)
+        poc = volume_profile_poc(df); session, allowed, _, _ = get_session_profile(cfg)
         ema200 = float(ema(close, 200).iloc[-1])
-
         last, prev = df.iloc[-1], df.iloc[-21:-1]
         op, hi, lo, cl = last["open"], last["high"], last["low"], last["close"]
         rng = max(hi - lo, 0.01)
@@ -716,20 +642,17 @@ class SignalGenerator:
         elif lo < prev["low"].min() and cl > prev["low"].min(): sweep = "BULL"
         h1_vr = last["volume"] / (df["volume"].iloc[-21:-1].mean() + 1e-10)
         m15_vr = (m15["volume"].iloc[-1] / (m15["volume"].iloc[-20:].mean() + 1e-10) if not md.m15_synthetic else 1.0)
-        
         f_score = 30.0
         if sweep != "NONE": f_score += 35.0
         if wick_pct > 40.0: f_score += 20.0
         if h1_vr > 1.2 or m15_vr > 1.3: f_score += 15.0
         f_score = min(f_score, 100.0)
-
         m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
         voter_agree, bull, bear, dbg = self._run_21_voters(df)
         combined = round((voter_agree * 0.6 + (f_score / 100.0) * 0.4) * 100, 1)
         intended = "BUY" if bull > bear else "SELL"
         macro_ok = ((intended == "BUY" and c_last > ema200) or (intended == "SELL" and c_last < ema200))
         gap = round(combined - threshold, 1)
-
         notes, action, skip_reason = [], "WAIT", None
         if not news.allowed: notes.append(f"NEWS: {news.reason}"); skip_reason = "NEWS"
         elif macro.blocks: notes.append(f"MACRO[{macro.severity}]: {macro.reason}"); skip_reason = f"MACRO_{macro.severity}"
@@ -739,9 +662,7 @@ class SignalGenerator:
         elif intended == "BUY" and m15_bull: action = "BUY"; notes.append(f"OK[{dom}/{session}] {combined}%")
         elif intended == "SELL" and not m15_bull: action = "SELL"; notes.append(f"OK[{dom}/{session}] {combined}%")
         else: notes.append("M15 misaligned"); skip_reason = "M15"
-
-        dbg["news_source"] = news.source
-        dbg["macro_severity"] = macro.severity
+        dbg["news_source"] = news.source; dbg["macro_severity"] = macro.severity
         return EnsembleResult(
             action=action, total_score=combined, voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
             regime=dom, regime_weights=weights, poc_level=round(poc, 2), notes=notes, atr_value=round(atr_val, 4),
@@ -751,7 +672,7 @@ class SignalGenerator:
 
 
 # ============================================================================
-# 10. AUDIT DB
+# 10. AUDIT DB & OUTCOME
 # ============================================================================
 def _to_utc_iso(dt_or_str: Any) -> str:
     if isinstance(dt_or_str, str): d = datetime.fromisoformat(dt_or_str)
@@ -778,8 +699,7 @@ class AuditDB:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)")
             self.conn.commit()
             self.ok = True
-        except Exception as e:
-            log_event(logging.WARNING, "db_init_fail", err=str(e)[:80])
+        except Exception as e: log_event(logging.WARNING, "db_init_fail", err=str(e)[:80])
 
     def _migrate(self) -> None:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(signals)").fetchall()}
@@ -851,92 +771,8 @@ class AuditDB:
         age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
         return (age < cooldown and a == action and rg == regime and abs(sp - spot) < tol)
 
-
-# ============================================================================
-# 11. RISK MANAGEMENT
-# ============================================================================
-class RiskManagementEngine:
-    def __init__(self, cfg: BotConfig, db: AuditDB):
-        self.cfg = cfg
-        self.db = db
-
-    def _consecutive_losses(self) -> Tuple[int, str]:
-        recent = self.db.get_recent_closed(self.cfg.cb_halt_consecutive)
-        n = 0
-        for s in recent:
-            if s.get("status") == "LOSS": n += 1
-            else: break
-        if n >= self.cfg.cb_halt_consecutive: return n, f"HALT after {n} consecutive losses"
-        if n >= 2: return n, f"derisk 50% ({n} consec losses)"
-        return n, "normal"
-
-    def _circuit_multiplier(self) -> Tuple[float, str]:
-        n, reason = self._consecutive_losses()
-        if n >= self.cfg.cb_halt_consecutive: return 0.0, reason
-        if n >= 2: return 0.5, reason
-        return 1.0, reason
-
-    def _daily_dd_multiplier(self) -> Tuple[float, str]:
-        today_r = self.db.get_today_r_sum()
-        if today_r <= -self.cfg.daily_dd_limit_r: return 0.0, f"DAILY_DD_HALT ({today_r:+.2f}R)"
-        if today_r <= -self.cfg.daily_dd_derisk_r: return self.cfg.daily_dd_derisk_mult, f"DAILY_DD_DERISK ({today_r:+.2f}R)"
-        return 1.0, f"daily OK ({today_r:+.2f}R)"
-
-    def kelly_risk_pct(self) -> Tuple[float, str]:
-        frac, cap = risk_pct_from_env()
-        R_history = SUPABASE.fetch_recent_r(50) if SUPABASE.enabled else None
-        if not R_history: R_history = self.db.get_recent_r(50)
-        if R_history and len(R_history) >= 20: return kelly_fraction(R_history, fraction=frac, cap_pct=cap)
-        n = len(R_history) if R_history else 0
-        return self.cfg.risk_pct, f"fallback {self.cfg.risk_pct}% (n={n}<20)"
-
-    def combined_multiplier(self) -> Tuple[float, str, str]:
-        cb_mult, cb_r = self._circuit_multiplier()
-        dd_mult, dd_r = self._daily_dd_multiplier()
-        return min(cb_mult, dd_mult), cb_r, dd_r
-
-    def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float, blended: dict, kelly_risk_pct: float, kelly_reason: str) -> Optional[dict]:
-        if sig not in ("BUY", "SELL"): return None
-        sl_d = max(atr_v * atr_mult, 1.0)
-        risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
-        raw_lot = risk_usd / (sl_d * 100.0)
-
-        MIN_LOT = 0.01
-        min_lot_risk_usd = MIN_LOT * sl_d * 100.0
-        min_lot_risk_pct = (min_lot_risk_usd / self.cfg.account_size_usd) * 100.0
-
-        if min_lot_risk_pct > self.cfg.max_lot_risk_pct:
-            req_acct = min_lot_risk_usd / (self.cfg.max_lot_risk_pct / 100.0)
-            return {"skip": True, "skip_reason": f"MIN_LOT_RISK_HIGH: 0.01 risks ${min_lot_risk_usd:.2f} ({min_lot_risk_pct:.2f}%) > max {self.cfg.max_lot_risk_pct}%", "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2), "sl_distance": round(sl_d, 2), "kelly_reason": kelly_reason}
-
-        lot = round(raw_lot - 0.005, 2)
-        if lot < MIN_LOT: lot = MIN_LOT
-        actual_risk = lot * sl_d * 100.0
-        actual_risk_pct = (actual_risk / self.cfg.account_size_usd) * 100.0
-
-        tp1_r = blended.get("tp1_mult", 1.5) or 1.5
-        tp2_r = blended.get("tp2_mult", 2.5) or 2.5
-        tp2_dist_raw = sl_d * tp2_r
-        tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
-        tp2_dist = min(tp2_dist_raw, tp2_dist_cap)
-        tp2_capped = tp2_dist < tp2_dist_raw
-
-        if sig == "BUY":
-            sl = entry - sl_d; tp1 = entry + sl_d * tp1_r; tp2 = entry + tp2_dist; be = entry + sl_d
-        else:
-            sl = entry + sl_d; tp1 = entry - sl_d * tp1_r; tp2 = entry - tp2_dist; be = entry - sl_d
-
-        if tp2_capped: kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}->{tp2_dist:.1f}"
-
-        return {"skip": False, "entry_price": round(entry, 2), "sl_price": round(sl, 2), "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2), "break_even_trigger": round(be, 2), "lot_size": lot, "risk_amount_usd": round(risk_usd, 2), "actual_risk_usd": round(actual_risk, 2), "actual_risk_pct": round(actual_risk_pct, 2), "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason, "tp2_capped": tp2_capped, "sl_distance": round(sl_d, 2), "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2)}
-
-
-# ============================================================================
-# 12. OUTCOME TRACKER
-# ============================================================================
 class OutcomeTracker:
-    def __init__(self, db: AuditDB):
-        self.db = db
+    def __init__(self, db: AuditDB): self.db = db
 
     @staticmethod
     def _resolve(action: str, bar_low: float, bar_high: float, sl: float, tp1: float) -> Optional[Tuple[str, float]]:
@@ -1012,13 +848,81 @@ class OutcomeTracker:
 
 
 # ============================================================================
-# 13. TELEGRAM NOTIFIER
+# 11. RISK MANAGEMENT
+# ============================================================================
+class RiskManagementEngine:
+    def __init__(self, cfg: BotConfig, db: AuditDB):
+        self.cfg = cfg; self.db = db
+
+    def _consecutive_losses(self) -> Tuple[int, str]:
+        recent = self.db.get_recent_closed(self.cfg.cb_halt_consecutive)
+        n = 0
+        for s in recent:
+            if s.get("status") == "LOSS": n += 1
+            else: break
+        if n >= self.cfg.cb_halt_consecutive: return n, f"HALT after {n} consecutive losses"
+        if n >= 2: return n, f"derisk 50% ({n} consec losses)"
+        return n, "normal"
+
+    def _circuit_multiplier(self) -> Tuple[float, str]:
+        n, reason = self._consecutive_losses()
+        if n >= self.cfg.cb_halt_consecutive: return 0.0, reason
+        if n >= 2: return 0.5, reason
+        return 1.0, reason
+
+    def _daily_dd_multiplier(self) -> Tuple[float, str]:
+        today_r = self.db.get_today_r_sum()
+        if today_r <= -self.cfg.daily_dd_limit_r: return 0.0, f"DAILY_DD_HALT ({today_r:+.2f}R)"
+        if today_r <= -self.cfg.daily_dd_derisk_r: return self.cfg.daily_dd_derisk_mult, f"DAILY_DD_DERISK ({today_r:+.2f}R)"
+        return 1.0, f"daily OK ({today_r:+.2f}R)"
+
+    def kelly_risk_pct(self) -> Tuple[float, str]:
+        frac, cap = risk_pct_from_env()
+        R_history = SUPABASE.fetch_recent_r(50) if SUPABASE.enabled else None
+        if not R_history: R_history = self.db.get_recent_r(50)
+        if R_history and len(R_history) >= 20: return kelly_fraction(R_history, fraction=frac, cap_pct=cap)
+        n = len(R_history) if R_history else 0
+        return self.cfg.risk_pct, f"fallback {self.cfg.risk_pct}% (n={n}<20)"
+
+    def combined_multiplier(self) -> Tuple[float, str, str]:
+        cb_mult, cb_r = self._circuit_multiplier()
+        dd_mult, dd_r = self._daily_dd_multiplier()
+        return min(cb_mult, dd_mult), cb_r, dd_r
+
+    def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float, blended: dict, kelly_risk_pct: float, kelly_reason: str) -> Optional[dict]:
+        if sig not in ("BUY", "SELL"): return None
+        sl_d = max(atr_v * atr_mult, 1.0)
+        risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
+        raw_lot = risk_usd / (sl_d * 100.0)
+        MIN_LOT = 0.01
+        min_lot_risk_usd = MIN_LOT * sl_d * 100.0
+        min_lot_risk_pct = (min_lot_risk_usd / self.cfg.account_size_usd) * 100.0
+
+        if min_lot_risk_pct > self.cfg.max_lot_risk_pct:
+            return {"skip": True, "skip_reason": f"MIN_LOT_RISK_HIGH: 0.01 risks ${min_lot_risk_usd:.2f} ({min_lot_risk_pct:.2f}%) > max {self.cfg.max_lot_risk_pct}%", "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2), "sl_distance": round(sl_d, 2), "kelly_reason": kelly_reason}
+
+        lot = round(raw_lot - 0.005, 2)
+        if lot < MIN_LOT: lot = MIN_LOT
+        actual_risk = lot * sl_d * 100.0
+        actual_risk_pct = (actual_risk / self.cfg.account_size_usd) * 100.0
+        tp1_r = blended.get("tp1_mult", 1.5) or 1.5; tp2_r = blended.get("tp2_mult", 2.5) or 2.5
+        tp2_dist_raw = sl_d * tp2_r; tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
+        tp2_dist = min(tp2_dist_raw, tp2_dist_cap); tp2_capped = tp2_dist < tp2_dist_raw
+
+        if sig == "BUY": sl = entry - sl_d; tp1 = entry + sl_d * tp1_r; tp2 = entry + tp2_dist; be = entry + sl_d
+        else: sl = entry + sl_d; tp1 = entry - sl_d * tp1_r; tp2 = entry - tp2_dist; be = entry - sl_d
+        if tp2_capped: kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}->{tp2_dist:.1f}"
+
+        return {"skip": False, "entry_price": round(entry, 2), "sl_price": round(sl, 2), "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2), "break_even_trigger": round(be, 2), "lot_size": lot, "risk_amount_usd": round(risk_usd, 2), "actual_risk_usd": round(actual_risk, 2), "actual_risk_pct": round(actual_risk_pct, 2), "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason, "tp2_capped": tp2_capped, "sl_distance": round(sl_d, 2), "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2)}
+
+
+# ============================================================================
+# 12. TELEGRAM NOTIFIER
 # ============================================================================
 def _strip_html(text: str) -> str: return re.sub(r"<[^>]+>", "", text)
 
 class TelegramNotifier:
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
+    def __init__(self, cfg: BotConfig): self.cfg = cfg
 
     def _post(self, payload: dict) -> bool:
         if not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id): return False
@@ -1033,8 +937,7 @@ class TelegramNotifier:
                     if "reply_markup" in payload: plain["reply_markup"] = payload["reply_markup"]
                     r2 = requests.post(url, json=plain, timeout=self.cfg.telegram_timeout)
                     return r2.status_code == 200
-            except Exception as e:
-                log_event(logging.WARNING, "telegram_exc", attempt=attempt + 1, err=str(e)[:120])
+            except Exception as e: log_event(logging.WARNING, "telegram_exc", attempt=attempt + 1, err=str(e)[:120])
             if attempt < self.cfg.telegram_retries - 1: time.sleep(2 ** attempt)
         return False
 
@@ -1073,7 +976,7 @@ class TelegramNotifier:
 
 
 # ============================================================================
-# 14. METAAPI EXECUTION ENGINE (NEW v9.3.0)
+# 13. METAAPI EXECUTION ENGINE
 # ============================================================================
 class MetaApiExecutionEngine:
     def __init__(self, cfg: BotConfig):
@@ -1084,34 +987,22 @@ class MetaApiExecutionEngine:
         if not self.enabled or not levels or levels.get("skip"): return "SKIPPED"
         try:
             api = MetaApi(self.cfg.metaapi_token)
-            
-            # 1. Dapatkan atau buat akun
             accounts = await api.metatrader_account_api.get_accounts()
             account = next((a for a in accounts if str(a.login) == str(self.cfg.mt5_login)), None)
             if not account:
                 log_event(logging.INFO, "metaapi_provisioning", login=self.cfg.mt5_login)
-                account = await api.metatrader_account_api.create_account({
-                    'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login,
-                    'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server,
-                    'platform': 'mt5', 'magic': 123456
-                })
+                account = await api.metatrader_account_api.create_account({'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login, 'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server, 'platform': 'mt5', 'magic': 123456})
             
             await account.wait_connected(timeout_in_seconds=60)
             connection = account.get_rpc_connection()
             await connection.connect()
             await connection.wait_synchronized()
             
-            # 2. Eksekusi Order
-            volume = levels["lot_size"]
-            sl = levels["sl_price"]
-            tp = levels["tp2_price"]
-            
+            volume = levels["lot_size"]; sl = levels["sl_price"]; tp = levels["tp2_price"]
             log_event(logging.INFO, "metaapi_firing_order", action=action, symbol=self.cfg.mt5_symbol, lot=volume, sl=sl, tp=tp)
             
-            if action == "BUY":
-                result = await connection.create_market_buy_order(self.cfg.mt5_symbol, volume, sl, tp)
-            else:
-                result = await connection.create_market_sell_order(self.cfg.mt5_symbol, volume, sl, tp)
+            if action == "BUY": result = await connection.create_market_buy_order(self.cfg.mt5_symbol, volume, sl, tp)
+            else: result = await connection.create_market_sell_order(self.cfg.mt5_symbol, volume, sl, tp)
                 
             return f"SUCCESS [ID: {result.get('orderId', 'N/A')}]"
         except Exception as e:
@@ -1120,17 +1011,15 @@ class MetaApiExecutionEngine:
             return f"FAILED: {err_msg}"
 
     def execute_trade(self, action: str, levels: dict) -> str:
-        """Wrapper sinkron untuk memanggil fungsi async dari script sinkron."""
         if not self.enabled: return "DISABLED"
-        try:
-            return asyncio.run(self._execute(action, levels))
+        try: return asyncio.run(self._execute(action, levels))
         except Exception as e:
             log_event(logging.ERROR, "asyncio_run_fail", err=str(e)[:150])
             return f"LOOP_ERROR: {str(e)[:100]}"
 
 
 # ============================================================================
-# 15. ORCHESTRATOR
+# 14. ORCHESTRATOR (WITH DUMMY DATA SAFETY GUARD)
 # ============================================================================
 class TradingBotOrchestrator:
     def __init__(self, cfg: BotConfig):
@@ -1167,6 +1056,13 @@ class TradingBotOrchestrator:
             self.tg.send_failure(err)
             print(f"ACTION: ERROR — {err}")
             return 1
+
+        # === SAFETY GUARD: DUMMY DATA PROTECTION ===
+        if md.source == "csv":
+            log_event(logging.ERROR, "dummy_data_active", msg="ALL API FEEDS FAILED. USING CSV. EXECUTION DISABLED FOR SAFETY.")
+            self.executor.enabled = False
+            self.cfg.execute_trades = False
+        # ============================================
 
         try:
             n_closed = self.outcomes.process(md.h1)
@@ -1215,16 +1111,13 @@ class TradingBotOrchestrator:
                 self.db.record(signal_id, e, tradable, levels, max_hold_h)
                 try_insert_signal(signal_id, e.action, tradable, levels["entry_price"], levels["sl_price"], levels["tp1_price"], levels["tp2_price"], e.total_score, e.regime, kelly_final/100.0, levels["lot_size"], levels["actual_risk_usd"], max_hold_h, "; ".join(e.notes))
                 
-                # --- METAAPI EXECUTION ---
                 if self.executor.enabled:
                     exec_status = self.executor.execute_trade(e.action, levels)
                     log_event(event="auto_trade_result", action=e.action, result=exec_status)
-                # -------------------------
             else:
                 signal_id = None
 
             sent = self.tg.send_signal(e, tradable, levels, cb_r, dd_r, exec_status=exec_status)
-            
             print(f"ACTION: {e.action} | Score: {e.total_score}% | Kelly: {kelly_final:.2f}% | Spot: {tradable:.2f} | TG: {sent} | Exec: {exec_status}")
             return 0
         except Exception as ex:
@@ -1235,7 +1128,7 @@ class TradingBotOrchestrator:
             return 1
 
 # ============================================================================
-# 16. MAIN
+# 15. MAIN
 # ============================================================================
 def main() -> int:
     return TradingBotOrchestrator(BotConfig.from_env()).run()
