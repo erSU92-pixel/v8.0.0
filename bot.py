@@ -1,10 +1,20 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.1.0 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.2.0 PRODUCTION
 ================================================================
-Changes v9.0.0 → v9.1.0:
-  [DATA]     Added Dukascopy (free, keyless, spot XAUUSD) as fallback #2
-  [SPOT]     Added gold-api.com (free, keyless) as spot price fallback #2
-  [ROBUST]   If Twelve Data quota exhausted, bot survives on free feeds.
+Changes v9.1.0 → v9.2.0:
+  [CRITICAL] Default account size $10,000 → $1,000 (match Headway demo).
+  [CRITICAL] Added `max_lot_risk_pct` guard: skip trade if min lot 0.01
+             would risk > max_lot_risk_pct of equity. Prevents over-risk
+             on small accounts where ATR-based SL > broker min-lot value.
+  [CRITICAL] Lot rounding changed from round() to round-down-biased
+             (never overshoots target risk).
+  [CRITICAL] kelly_final is capped by max_lot_risk_pct (target risk
+             cannot exceed the hard ceiling).
+  [CLEANUP]  Removed dead `dukascopy_fallback.py` reference (never used).
+  [RISK]     Daily DD limit 3.0R → 2.0R (small account).
+  [RISK]     CB consecutive halt 5 → 3 (small account).
+  [TELEGRAM] Surfaces skip_reason + min-lot risk info for blocked trades.
+  [NEWS]     Static fallback labeled "APPROXIMATE" downstream.
 """
 from __future__ import annotations
 
@@ -12,6 +22,7 @@ import calendar
 import html
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -49,7 +60,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.1.0"
+VERSION = "9.2.0"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -65,8 +76,14 @@ class BotConfig:
     http_timeout: int = 12
     telegram_timeout: int = 8
     telegram_retries: int = 3
-    account_size_usd: float = 10_000.0
+    # === ACCOUNT: screenshot shows $1,000 Headway Demo ===
+    account_size_usd: float = 1_000.0
     risk_pct: float = 1.0
+    # Hard guard: skip trade if min lot (0.01) risks more than this %
+    # NOTE: On $1,000 XAUUSD account, min-lot risk is typically 2-3%.
+    # Set to 2.5 to allow most trades; set to 2.0 to be ultra-conservative
+    # (will skip most gold H1 setups). Upgrade account to $5,000+ for 1%.
+    max_lot_risk_pct: float = 2.5
     signal_cooldown_min: int = 30
     spot_cache_min: int = 2
     macro_cache_min: int = 30
@@ -81,10 +98,11 @@ class BotConfig:
     tnx_veto: float = 1.5
     tnx_halt: float = 3.0
     max_tp2_atr_mult: float = 4.0
-    daily_dd_limit_r: float = 3.0
-    daily_dd_derisk_r: float = 2.0
+    # Small-account defaults
+    daily_dd_limit_r: float = 2.0
+    daily_dd_derisk_r: float = 1.0
     daily_dd_derisk_mult: float = 0.5
-    cb_halt_consecutive: int = 5
+    cb_halt_consecutive: int = 3
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -94,14 +112,15 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> "BotConfig":
         return cls(
-            account_size_usd=float(os.getenv("ACCOUNT_SIZE_USD", "10000")),
+            account_size_usd=float(os.getenv("ACCOUNT_SIZE_USD", "1000")),
             risk_pct=float(os.getenv("RISK_PCT", "1.0")),
+            max_lot_risk_pct=float(os.getenv("MAX_LOT_RISK_PCT", "2.5")),
             news_enabled=os.getenv("NEWS_ENABLED", "1") == "1",
             notify_wait=os.getenv("NOTIFY_WAIT", "0") == "1",
-            daily_dd_limit_r=float(os.getenv("DAILY_DD_LIMIT_R", "3.0")),
-            daily_dd_derisk_r=float(os.getenv("DAILY_DD_DERISK_R", "2.0")),
+            daily_dd_limit_r=float(os.getenv("DAILY_DD_LIMIT_R", "2.0")),
+            daily_dd_derisk_r=float(os.getenv("DAILY_DD_DERISK_R", "1.0")),
             daily_dd_derisk_mult=float(os.getenv("DAILY_DD_DERISK_MULT", "0.5")),
-            cb_halt_consecutive=int(os.getenv("CB_HALT_CONSECUTIVE", "5")),
+            cb_halt_consecutive=int(os.getenv("CB_HALT_CONSECUTIVE", "3")),
             twelve_data_api_key=os.getenv("TWELVE_DATA_API_KEY"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
@@ -117,6 +136,14 @@ class BotConfig:
             w.append("Telegram creds missing → stdout only")
         if not SUPABASE.enabled:
             w.append("Supabase disabled → SQLite-only, Kelly may never activate")
+        if self.account_size_usd < 5000:
+            w.append(
+                f"INFO: Account ${self.account_size_usd:.0f} — on XAUUSD H1, "
+                f"broker min lot (0.01) risks ~2-3% equity per trade. "
+                f"RISK_PCT={self.risk_pct}% is a TARGET; actual is capped at "
+                f"MAX_LOT_RISK_PCT={self.max_lot_risk_pct}%. "
+                f"Upgrade to $5,000+ or use Cent account for true 1% risk."
+            )
         return w
 
 
@@ -359,7 +386,7 @@ def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
 
 
 # ============================================================================
-# 7. MARKET DATA HANDLER (with Dukascopy & Gold-API fallbacks)
+# 7. MARKET DATA HANDLER
 # ============================================================================
 def _retry_session(retries: int, backoff: float) -> requests.Session:
     s = requests.Session()
@@ -416,7 +443,7 @@ class MarketDataHandler:
             end = datetime.now(timezone.utc)
             start_h1 = end - timedelta(days=30)
             start_m15 = end - timedelta(days=5)
-            
+
             df_h1 = dukascopy_python.fetch(
                 instrument="XAU/USD", interval="1HOUR", offer_side="BID",
                 start=start_h1, end=end
@@ -425,35 +452,35 @@ class MarketDataHandler:
                 instrument="XAU/USD", interval="15MIN", offer_side="BID",
                 start=start_m15, end=end
             )
-            
+
             if df_h1 is None or len(df_h1) < self.cfg.min_bars:
                 return None
-                
+
             df_h1 = df_h1.reset_index().rename(columns={
-                "timestamp": "time", "open": "open", "high": "high", 
+                "timestamp": "time", "open": "open", "high": "high",
                 "low": "low", "close": "close", "volume": "volume"
             })
             df_h1["time"] = pd.to_datetime(df_h1["time"], utc=True).dt.tz_localize(None)
             if "volume" not in df_h1.columns:
                 df_h1["volume"] = 1000.0
-            
+
             if df_m15 is None or len(df_m15) < 50:
                 m15 = df_h1.set_index("time").resample("15min").ffill().reset_index()
                 m15["volume"] /= 4.0
                 synth = True
             else:
                 m15 = df_m15.reset_index().rename(columns={
-                    "timestamp": "time", "open": "open", "high": "high", 
+                    "timestamp": "time", "open": "open", "high": "high",
                     "low": "low", "close": "close", "volume": "volume"
                 })
                 m15["time"] = pd.to_datetime(m15["time"], utc=True).dt.tz_localize(None)
                 if "volume" not in m15.columns:
                     m15["volume"] = 1000.0
                 synth = False
-                
+
             df_h1 = df_h1.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
             m15 = m15.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
-            
+
             return MarketData(df_h1, m15, "dukascopy", m15_synthetic=synth)
         except Exception as e:
             log_event(logging.WARNING, "dukascopy_fail", err=str(e)[:120])
@@ -523,7 +550,6 @@ class MarketDataHandler:
         return MarketData(df, m15, "csv", m15_synthetic=True)
 
     def fetch(self) -> MarketData:
-        # 1. Twelve Data
         try:
             h1 = self._twelve("1h", 500)
             m15 = self._twelve("15min", 200)
@@ -543,7 +569,6 @@ class MarketDataHandler:
         except Exception as e:
             log_event(logging.WARNING, "twelvedata_fail", err=str(e)[:120])
 
-        # 2. Dukascopy (Free, Keyless)
         try:
             md = self._dukascopy()
             if md is not None:
@@ -555,7 +580,6 @@ class MarketDataHandler:
         except Exception as e:
             log_event(logging.WARNING, "dukascopy_validation_fail", err=str(e)[:120])
 
-        # 3. yfinance
         try:
             md = self._yf()
             validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1",
@@ -566,7 +590,6 @@ class MarketDataHandler:
         except Exception as e:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
 
-        # 4. CSV (last resort)
         md = self._csv()
         validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True,
                        max_stale_off_h=168.0)
@@ -577,10 +600,7 @@ class MarketDataHandler:
             ts, v = self._spot_cache
             if (datetime.now(timezone.utc) - ts).total_seconds() < self.cfg.spot_cache_min * 60:
                 return v
-        
         price = None
-        
-        # 1. Twelve Data
         if self.cfg.twelve_data_api_key:
             try:
                 r = self.session.get(
@@ -592,8 +612,6 @@ class MarketDataHandler:
                     price = p
             except Exception:
                 pass
-
-        # 2. Gold-API (Free, Keyless)
         if price is None:
             try:
                 r = self.session.get("https://api.gold-api.com/price/XAU", timeout=5)
@@ -603,8 +621,6 @@ class MarketDataHandler:
                     price = p
             except Exception:
                 pass
-
-        # 3. yfinance
         if price is None and yf is not None:
             try:
                 p = float(yf.Ticker("GC=F").fast_info["last_price"])
@@ -612,11 +628,8 @@ class MarketDataHandler:
                     price = p
             except Exception:
                 pass
-
-        # 4. Last H1 close
         if price is None:
             price = float(h1["close"].iloc[-1])
-            
         self._spot_cache = (datetime.now(timezone.utc), price)
         return price
 
@@ -680,7 +693,7 @@ def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
             elif abs(dxy_chg) >= cfg.dxy_warn:
                 severity = "WARN"
                 notes.append(f"DXY±{dxy_chg:.2f}%")
-                
+
         if len(tnx) >= 2:
             tnx_chg = float((tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100)
             if abs(tnx_chg) >= cfg.tnx_halt:
@@ -740,6 +753,7 @@ class EnsembleResult:
     gap_to_threshold: float = 0.0
     params_source: str = "builtin"
     voters_debug: Dict[str, Any] = field(default_factory=dict)
+    skip_reason: Optional[str] = None
 
 
 class SignalGenerator:
@@ -849,17 +863,22 @@ class SignalGenerator:
                     or (intended == "SELL" and c_last < ema200))
         gap = round(combined - threshold, 1)
 
-        notes, action = [], "WAIT"
+        notes, action, skip_reason = [], "WAIT", None
         if not news.allowed:
             notes.append(f"NEWS: {news.reason}")
+            skip_reason = "NEWS"
         elif macro.blocks:
             notes.append(f"MACRO[{macro.severity}]: {macro.reason}")
+            skip_reason = f"MACRO_{macro.severity}"
         elif not allowed:
             notes.append(f"SESSION: {session}")
+            skip_reason = "SESSION"
         elif combined < threshold:
             notes.append(f"GATED[{dom}]: {combined}% under {threshold:.1f}% (gap {gap:+.1f})")
+            skip_reason = "GATE"
         elif not macro_ok:
             notes.append("VETO EMA200 H1")
+            skip_reason = "EMA200"
         elif intended == "BUY" and m15_bull:
             action = "BUY"
             notes.append(f"OK[{dom}/{session}] {combined}%")
@@ -868,6 +887,7 @@ class SignalGenerator:
             notes.append(f"OK[{dom}/{session}] {combined}%")
         else:
             notes.append("M15 misaligned")
+            skip_reason = "M15"
 
         if macro.severity == "WARN":
             notes.append(f"macro_warn: {macro.reason}")
@@ -882,6 +902,7 @@ class SignalGenerator:
             blended_params={k: round(v, 4) for k, v in blended.items()},
             threshold=round(threshold, 1), gap_to_threshold=gap,
             params_source=self.params_source, voters_debug=dbg,
+            skip_reason=skip_reason,
         )
 
 
@@ -1068,7 +1089,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 12. RISK MANAGEMENT ENGINE
+# 12. RISK MANAGEMENT ENGINE (with min-lot guard)
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -1085,20 +1106,16 @@ class RiskManagementEngine:
                 break
         if n >= self.cfg.cb_halt_consecutive:
             return n, f"HALT after {n} consecutive losses"
-        if n >= 3:
-            return n, f"derisk 50% ({n} consec losses)"
         if n >= 2:
-            return n, f"derisk 25% ({n} consec losses)"
+            return n, f"derisk 50% ({n} consec losses)"
         return n, "normal"
 
     def _circuit_multiplier(self) -> Tuple[float, str]:
         n, reason = self._consecutive_losses()
         if n >= self.cfg.cb_halt_consecutive:
             return 0.0, reason
-        if n >= 3:
-            return 0.5, reason
         if n >= 2:
-            return 0.75, reason
+            return 0.5, reason
         return 1.0, reason
 
     def _daily_dd_multiplier(self) -> Tuple[float, str]:
@@ -1130,17 +1147,49 @@ class RiskManagementEngine:
     def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float,
                        blended: dict, kelly_risk_pct: float,
                        kelly_reason: str) -> Optional[dict]:
+        """
+        XAUUSD LOT MATH (verified):
+          1.00 lot = 100 troy oz
+          $1.00 price move × 1.00 lot = $100 P/L
+          $1.00 price move × 0.01 lot = $1.00 P/L
+          ⇒ lot = risk_usd / (sl_distance_$ × 100)
+
+        Rounding rule: FLOOR to 0.01 (never overshoot target risk).
+        Min-lot guard: if floor to 0.01 risks > max_lot_risk_pct, SKIP.
+        """
         if sig not in ("BUY", "SELL"):
             return None
         sl_d = max(atr_v * atr_mult, 1.0)
         risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
         raw_lot = risk_usd / (sl_d * 100.0)
-        lot = round(raw_lot, 2)
-        if lot < 0.01:
-            lot = 0.01
-        if lot * sl_d * 100.0 > risk_usd * 1.10 and lot > 0.01:
-            lot = max(round(raw_lot - 0.01, 2), 0.01)
+
+        # ── MIN-LOT FEASIBILITY GUARD ──────────────────────────────
+        MIN_LOT = 0.01
+        min_lot_risk_usd = MIN_LOT * sl_d * 100.0
+        min_lot_risk_pct = (min_lot_risk_usd / self.cfg.account_size_usd) * 100.0
+
+        if min_lot_risk_pct > self.cfg.max_lot_risk_pct:
+            required_account = min_lot_risk_usd / (self.cfg.max_lot_risk_pct / 100.0)
+            return {
+                "skip": True,
+                "skip_reason": (
+                    f"MIN_LOT_RISK_HIGH: lot {MIN_LOT} risks ${min_lot_risk_usd:.2f} "
+                    f"({min_lot_risk_pct:.2f}%) > max {self.cfg.max_lot_risk_pct}% "
+                    f"(SL ${sl_d:.2f}). "
+                    f"Upgrade to ≥ ${required_account:.0f} or use Cent account."
+                ),
+                "min_lot_risk_usd": round(min_lot_risk_usd, 2),
+                "min_lot_risk_pct": round(min_lot_risk_pct, 2),
+                "sl_distance": round(sl_d, 2),
+                "kelly_reason": kelly_reason,
+            }
+
+        # FLOOR to 0.01, never round up (avoid overshoot target risk)
+        lot = round(raw_lot - 0.005, 2)
+        if lot < MIN_LOT:
+            lot = MIN_LOT
         actual_risk = lot * sl_d * 100.0
+        actual_risk_pct = (actual_risk / self.cfg.account_size_usd) * 100.0
 
         tp1_r = blended.get("tp1_mult", 1.5) or 1.5
         tp2_r = blended.get("tp2_mult", 2.5) or 2.5
@@ -1165,13 +1214,18 @@ class RiskManagementEngine:
             kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}→{tp2_dist:.1f} (4×ATR)"
 
         return {
+            "skip": False,
             "entry_price": round(entry, 2), "sl_price": round(sl, 2),
             "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2),
             "break_even_trigger": round(be, 2),
             "lot_size": lot, "risk_amount_usd": round(risk_usd, 2),
             "actual_risk_usd": round(actual_risk, 2),
+            "actual_risk_pct": round(actual_risk_pct, 2),
             "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason,
             "tp2_capped": tp2_capped,
+            "sl_distance": round(sl_d, 2),
+            "min_lot_risk_usd": round(min_lot_risk_usd, 2),
+            "min_lot_risk_pct": round(min_lot_risk_pct, 2),
         }
 
 
@@ -1346,10 +1400,26 @@ class TelegramNotifier:
             f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
             f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
         safe_reason = html.escape(e.notes[0]) if e.notes else ""
-        safe_kelly = html.escape(levels["kelly_reason"]) if levels else ""
+        safe_kelly = html.escape(levels["kelly_reason"]) if (levels and "kelly_reason" in levels) else ""
         safe_cb = html.escape(cb_reason)
         safe_dd = html.escape(dd_reason)
 
+        # ── SKIP MODE (min-lot guard triggered) ──────────────────────
+        if levels and levels.get("skip"):
+            text = (f"⛔ <b>XAUUSD v{VERSION} — SKIP</b>\n"
+                    f"⏰ <code>{now}</code>\n───────────────────\n"
+                    f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
+                    f"Signal would be <b>{e.action}</b> but BLOCKED:\n"
+                    f"<i>{html.escape(levels.get('skip_reason', ''))}</i>\n"
+                    f"ATR: ${e.atr_value:.2f} | SL dist: ${levels.get('sl_distance', 0):.2f}\n"
+                    f"Min-lot risk: ${levels.get('min_lot_risk_usd', 0):.2f} "
+                    f"({levels.get('min_lot_risk_pct', 0):.2f}%)\n"
+                    f"Account: ${self.cfg.account_size_usd:.0f} | Max allowed: {self.cfg.max_lot_risk_pct}%")
+            return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
+                               "parse_mode": "HTML", "reply_markup": kb,
+                               "disable_web_page_preview": True})
+
+        # ── WAIT ─────────────────────────────────────────────────────
         if e.action == "WAIT" or not levels:
             text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                     f"⏰ <code>{now}</code>\n"
@@ -1357,6 +1427,7 @@ class TelegramNotifier:
                     f"Reason: {safe_reason}\n"
                     f"<i>CB: {safe_cb} | DD: {safe_dd}</i>\n"
                     f"<i>Next check: ~{next_eta_min}m</i>")
+        # ── ACTIONABLE SIGNAL ───────────────────────────────────────
         else:
             em = "🟢" if e.action == "BUY" else "🔴"
             tp2_note = " (capped)" if levels.get("tp2_capped") else ""
@@ -1371,7 +1442,8 @@ class TelegramNotifier:
                     f"TP2   : ${levels['tp2_price']:.2f}{tp2_note}\n"
                     f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
                     f"Lot: <b>{levels['lot_size']}</b> | "
-                    f"Risk: ${levels['actual_risk_usd']:.0f} ({levels['risk_pct']:.2f}%)\n"
+                    f"Risk: ${levels['actual_risk_usd']:.2f} "
+                    f"({levels['actual_risk_pct']:.2f}%)\n"
                     f"<i>Kelly: {safe_kelly}</i>\n"
                     f"<i>CB: {safe_cb} | DD: {safe_dd}</i>")
         return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
@@ -1418,6 +1490,9 @@ class TradingBotOrchestrator:
                   params_source=self.params_source,
                   supabase_enabled=SUPABASE.enabled,
                   notify_wait=self.cfg.notify_wait,
+                  account_size_usd=self.cfg.account_size_usd,
+                  risk_pct=self.cfg.risk_pct,
+                  max_lot_risk_pct=self.cfg.max_lot_risk_pct,
                   warnings=self.cfg.warnings())
 
         if not SUPABASE.enabled:
@@ -1462,12 +1537,28 @@ class TradingBotOrchestrator:
 
             kelly_base, kelly_reason = self.risk.kelly_risk_pct()
             kelly_final = round(kelly_base * mult, 2)
+            # Hard ceiling: target risk cannot exceed max_lot_risk_pct
+            if kelly_final > self.cfg.max_lot_risk_pct:
+                kelly_reason = (f"{kelly_reason} | capped "
+                                f"{kelly_final:.2f}%→{self.cfg.max_lot_risk_pct}%")
+                kelly_final = self.cfg.max_lot_risk_pct
             if mult < 1.0:
                 kelly_reason = f"{kelly_reason} | mult={mult:.2f} | CB:{cb_r} | DD:{dd_r}"
 
             levels = self.risk.compute_levels(
                 e.action, tradable, e.atr_value, e.atr_multiplier,
                 e.blended_params, kelly_final, kelly_reason)
+
+            # ── MIN-LOT GUARD SKIP ──────────────────────────────────
+            if levels and levels.get("skip"):
+                log_event(event="trade_skipped_min_lot",
+                          action=e.action, reason=levels.get("skip_reason"),
+                          min_lot_risk_pct=levels.get("min_lot_risk_pct"),
+                          account_size=self.cfg.account_size_usd,
+                          max_allowed_pct=self.cfg.max_lot_risk_pct)
+                self.tg.send_signal(e, tradable, levels, cb_r, dd_r)
+                print(f"ACTION: SKIP — {levels.get('skip_reason')}")
+                return 0
 
             if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action,
                                          tradable, e.regime):
@@ -1504,7 +1595,8 @@ class TradingBotOrchestrator:
                       params_source=e.params_source,
                       kelly_base=kelly_base, kelly_final=kelly_final,
                       kelly_reason=kelly_reason, mult=mult, cb=cb_r, dd=dd_r,
-                      signal_id=signal_id, tg=sent)
+                      signal_id=signal_id, tg=sent,
+                      skip_reason=e.skip_reason)
             print(f"ACTION: {e.action} | Score: {e.total_score}% "
                   f"(thr {e.threshold:.1f}, gap {e.gap_to_threshold:+.1f}) | "
                   f"Regime: {e.regime} | Kelly: {kelly_final:.2f}% (×{mult}) | "
