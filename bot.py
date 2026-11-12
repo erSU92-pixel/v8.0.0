@@ -1,20 +1,15 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.2.0 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.2.1 PRODUCTION
 ================================================================
-Changes v9.1.0 → v9.2.0:
-  [CRITICAL] Default account size $10,000 → $1,000 (match Headway demo).
-  [CRITICAL] Added `max_lot_risk_pct` guard: skip trade if min lot 0.01
-             would risk > max_lot_risk_pct of equity. Prevents over-risk
-             on small accounts where ATR-based SL > broker min-lot value.
-  [CRITICAL] Lot rounding changed from round() to round-down-biased
-             (never overshoots target risk).
-  [CRITICAL] kelly_final is capped by max_lot_risk_pct (target risk
-             cannot exceed the hard ceiling).
-  [CLEANUP]  Removed dead `dukascopy_fallback.py` reference (never used).
-  [RISK]     Daily DD limit 3.0R → 2.0R (small account).
-  [RISK]     CB consecutive halt 5 → 3 (small account).
-  [TELEGRAM] Surfaces skip_reason + min-lot risk info for blocked trades.
-  [NEWS]     Static fallback labeled "APPROXIMATE" downstream.
+Changes v9.2.0 → v9.2.1:
+  [TELEGRAM] Default behavior now sends ONLY valid executable BUY/SELL
+             signals + bot errors. WAIT, SKIP (min-lot), and HALT
+             (risk lock) are suppressed by default to reduce noise.
+             Opt-in via env: NOTIFY_WAIT=1, NOTIFY_SKIP=1, NOTIFY_HALT=1.
+  [TELEGRAM] HALT now renders its own message (was previously disguised
+             as WAIT, misleading when action was BUY/SELL).
+  [NO CHANGE] Signal logic, risk engine, macro filter, data sources,
+              Kelly, outcome tracker, dedup — all identical to v9.2.0.
 """
 from __future__ import annotations
 
@@ -60,7 +55,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.2.0"
+VERSION = "9.2.1"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -80,15 +75,17 @@ class BotConfig:
     account_size_usd: float = 1_000.0
     risk_pct: float = 1.0
     # Hard guard: skip trade if min lot (0.01) risks more than this %
-    # NOTE: On $1,000 XAUUSD account, min-lot risk is typically 2-3%.
-    # Set to 2.5 to allow most trades; set to 2.0 to be ultra-conservative
-    # (will skip most gold H1 setups). Upgrade account to $5,000+ for 1%.
     max_lot_risk_pct: float = 2.5
     signal_cooldown_min: int = 30
     spot_cache_min: int = 2
     macro_cache_min: int = 30
     news_enabled: bool = True
-    notify_wait: bool = False
+    # ── Notification verbosity (NEW in v9.2.1) ─────────────────────
+    # Default: ONLY valid executable BUY/SELL signals + bot errors.
+    notify_wait: bool = False   # WAIT updates (bot alive but no setup)
+    notify_skip: bool = False   # min-lot SKIP alerts (need bigger account)
+    notify_halt: bool = False   # risk HALT alerts (CB or DD lockout)
+    # ────────────────────────────────────────────────────────────────
     max_stale_h_market: float = 1.5
     max_stale_h_off: float = 72.0
     dxy_warn: float = 0.3
@@ -117,6 +114,8 @@ class BotConfig:
             max_lot_risk_pct=float(os.getenv("MAX_LOT_RISK_PCT", "2.5")),
             news_enabled=os.getenv("NEWS_ENABLED", "1") == "1",
             notify_wait=os.getenv("NOTIFY_WAIT", "0") == "1",
+            notify_skip=os.getenv("NOTIFY_SKIP", "0") == "1",
+            notify_halt=os.getenv("NOTIFY_HALT", "0") == "1",
             daily_dd_limit_r=float(os.getenv("DAILY_DD_LIMIT_R", "2.0")),
             daily_dd_derisk_r=float(os.getenv("DAILY_DD_DERISK_R", "1.0")),
             daily_dd_derisk_mult=float(os.getenv("DAILY_DD_DERISK_MULT", "0.5")),
@@ -1089,7 +1088,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 12. RISK MANAGEMENT ENGINE (with min-lot guard)
+# 12. RISK MANAGEMENT ENGINE
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -1147,23 +1146,12 @@ class RiskManagementEngine:
     def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float,
                        blended: dict, kelly_risk_pct: float,
                        kelly_reason: str) -> Optional[dict]:
-        """
-        XAUUSD LOT MATH (verified):
-          1.00 lot = 100 troy oz
-          $1.00 price move × 1.00 lot = $100 P/L
-          $1.00 price move × 0.01 lot = $1.00 P/L
-          ⇒ lot = risk_usd / (sl_distance_$ × 100)
-
-        Rounding rule: FLOOR to 0.01 (never overshoot target risk).
-        Min-lot guard: if floor to 0.01 risks > max_lot_risk_pct, SKIP.
-        """
         if sig not in ("BUY", "SELL"):
             return None
         sl_d = max(atr_v * atr_mult, 1.0)
         risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
         raw_lot = risk_usd / (sl_d * 100.0)
 
-        # ── MIN-LOT FEASIBILITY GUARD ──────────────────────────────
         MIN_LOT = 0.01
         min_lot_risk_usd = MIN_LOT * sl_d * 100.0
         min_lot_risk_pct = (min_lot_risk_usd / self.cfg.account_size_usd) * 100.0
@@ -1184,7 +1172,6 @@ class RiskManagementEngine:
                 "kelly_reason": kelly_reason,
             }
 
-        # FLOOR to 0.01, never round up (avoid overshoot target risk)
         lot = round(raw_lot - 0.005, 2)
         if lot < MIN_LOT:
             lot = MIN_LOT
@@ -1385,11 +1372,32 @@ class TelegramNotifier:
     def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict],
                     cb_reason: str = "normal", dd_reason: str = "daily OK",
                     next_eta_min: int = 20) -> bool:
+        """
+        Notification policy (v9.2.1):
+          • Valid BUY/SELL (executable levels) → ALWAYS sent
+          • Bot errors → ALWAYS sent (via send_failure)
+          • WAIT, SKIP (min-lot), HALT → suppressed unless opt-in
+        """
+        # ── 1. WAIT SUPPRESSION ─────────────────────────────────────
         if e.action == "WAIT" and not self.cfg.notify_wait:
             log_event(event="telegram_suppressed", action="WAIT",
-                      score=e.total_score, reason=e.notes[0] if e.notes else "")
+                      score=e.total_score,
+                      reason=e.notes[0] if e.notes else "")
             return False
 
+        # ── 2. HALT SUPPRESSION (risk lock, levels=None on BUY/SELL) ─
+        if e.action in ("BUY", "SELL") and levels is None and not self.cfg.notify_halt:
+            log_event(event="telegram_suppressed", action="HALT",
+                      score=e.total_score, reason=cb_reason)
+            return False
+
+        # ── 3. SKIP SUPPRESSION (min-lot guard) ─────────────────────
+        if levels is not None and levels.get("skip") and not self.cfg.notify_skip:
+            log_event(event="telegram_suppressed", action="SKIP",
+                      score=e.total_score, reason=levels.get("skip_reason"))
+            return False
+
+        # ── Fall-through: send (valid signal OR user opted in) ──────
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         kb = {"inline_keyboard": [[
             {"text": "🔄 Refresh", "callback_data": "refresh"},
@@ -1404,8 +1412,9 @@ class TelegramNotifier:
         safe_cb = html.escape(cb_reason)
         safe_dd = html.escape(dd_reason)
 
-        # ── SKIP MODE (min-lot guard triggered) ──────────────────────
-        if levels and levels.get("skip"):
+        # ── Dispatch: SKIP / HALT / WAIT / VALID ─────────────────────
+        if levels is not None and levels.get("skip"):
+            # Min-lot SKIP (opt-in only)
             text = (f"⛔ <b>XAUUSD v{VERSION} — SKIP</b>\n"
                     f"⏰ <code>{now}</code>\n───────────────────\n"
                     f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
@@ -1415,20 +1424,25 @@ class TelegramNotifier:
                     f"Min-lot risk: ${levels.get('min_lot_risk_usd', 0):.2f} "
                     f"({levels.get('min_lot_risk_pct', 0):.2f}%)\n"
                     f"Account: ${self.cfg.account_size_usd:.0f} | Max allowed: {self.cfg.max_lot_risk_pct}%")
-            return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
-                               "parse_mode": "HTML", "reply_markup": kb,
-                               "disable_web_page_preview": True})
-
-        # ── WAIT ─────────────────────────────────────────────────────
-        if e.action == "WAIT" or not levels:
+        elif levels is None and e.action in ("BUY", "SELL"):
+            # Risk HALT (opt-in only)
+            text = (f"🛑 <b>XAUUSD v{VERSION} — HALT</b>\n"
+                    f"⏰ <code>{now}</code>\n───────────────────\n"
+                    f"Signal: <b>{e.action}</b> (would have been executed)\n"
+                    f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
+                    f"Blocked by risk engine:\n"
+                    f"• CB: {safe_cb}\n"
+                    f"• DD: {safe_dd}")
+        elif e.action == "WAIT" or not levels:
+            # WAIT (opt-in only)
             text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                     f"⏰ <code>{now}</code>\n"
                     f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
                     f"Reason: {safe_reason}\n"
                     f"<i>CB: {safe_cb} | DD: {safe_dd}</i>\n"
                     f"<i>Next check: ~{next_eta_min}m</i>")
-        # ── ACTIONABLE SIGNAL ───────────────────────────────────────
         else:
+            # VALID BUY/SELL — the money message
             em = "🟢" if e.action == "BUY" else "🔴"
             tp2_note = " (capped)" if levels.get("tp2_capped") else ""
             text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
@@ -1446,6 +1460,7 @@ class TelegramNotifier:
                     f"({levels['actual_risk_pct']:.2f}%)\n"
                     f"<i>Kelly: {safe_kelly}</i>\n"
                     f"<i>CB: {safe_cb} | DD: {safe_dd}</i>")
+
         return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
                            "parse_mode": "HTML", "reply_markup": kb,
                            "disable_web_page_preview": True})
@@ -1490,6 +1505,8 @@ class TradingBotOrchestrator:
                   params_source=self.params_source,
                   supabase_enabled=SUPABASE.enabled,
                   notify_wait=self.cfg.notify_wait,
+                  notify_skip=self.cfg.notify_skip,
+                  notify_halt=self.cfg.notify_halt,
                   account_size_usd=self.cfg.account_size_usd,
                   risk_pct=self.cfg.risk_pct,
                   max_lot_risk_pct=self.cfg.max_lot_risk_pct,
@@ -1537,7 +1554,6 @@ class TradingBotOrchestrator:
 
             kelly_base, kelly_reason = self.risk.kelly_risk_pct()
             kelly_final = round(kelly_base * mult, 2)
-            # Hard ceiling: target risk cannot exceed max_lot_risk_pct
             if kelly_final > self.cfg.max_lot_risk_pct:
                 kelly_reason = (f"{kelly_reason} | capped "
                                 f"{kelly_final:.2f}%→{self.cfg.max_lot_risk_pct}%")
@@ -1549,7 +1565,6 @@ class TradingBotOrchestrator:
                 e.action, tradable, e.atr_value, e.atr_multiplier,
                 e.blended_params, kelly_final, kelly_reason)
 
-            # ── MIN-LOT GUARD SKIP ──────────────────────────────────
             if levels and levels.get("skip"):
                 log_event(event="trade_skipped_min_lot",
                           action=e.action, reason=levels.get("skip_reason"),
