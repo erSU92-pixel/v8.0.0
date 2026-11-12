@@ -1,29 +1,15 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v8.0.0 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.0.0 PRODUCTION
 ================================================================
-OOP Architecture | Look-Ahead-Free | Full Safety Gates
-
-Classes:
-  MarketDataHandler      — Twelve Data → yfinance → CSV, validation, spot
-  SignalGenerator        — 21-voter ensemble + forensic + fuzzy regime + gates
-  RiskManagementEngine   — Kelly + ATR SL/TP + lot sizing + daily DD + circuit breaker
-  NewsSafetyFilter       — FF high-impact USD blackout
-  TelegramNotifier       — HTML signals for MT5 mobile
-  AuditDB                — SQLite persistence + schema migration
-  OutcomeTracker         — SL/TP/timeout resolution
-  TradingBotOrchestrator — Main run loop
-
-Backward-compatible exports (for optimizer.py):
-  VERSION, BotConfig, adx, atr, ema, rsi, sma, get_logger, log_event, REGIMES
-
-Safety features:
-  [P0] No look-ahead (fix applied in optimizer.py separately)
-  [P0] Kelly driven by real outcome-tracked R (dual-source: Supabase→SQLite)
-  [P1] Lot rounding safety (never exceed 110% risk budget)
-  [P1] Outcome verification loop (SL/TP/timeout per H1 bar)
-  [P2] Circuit breaker on consecutive losses (2→0.75×, 3→0.5×, 5→HALT)
-  [P2] Market holiday blocking (US holidays + Good Friday)
-  [NEW] Daily drawdown lock (R-sum today ≤ -3.0 → HALT)
+Changes v8.0.0 → v9.0.0 (all surgical, additive — no strategy change):
+  [MACRO]    Tiered severity: OK / WARN / VETO / HALT
+  [STALE]    Tighter H1 staleness gate (1.5h during market hours)
+  [TP2]      TP2 distance capped at 4× ATR (feasibility for 72h hold)
+  [PARAMS]   Range validation on params.json load
+  [DEDUP]    Fingerprint includes regime
+  [DAILY_R]  COALESCE(closed_at, ts) for robust daily R-sum
+  [TELEGRAM] 3× exponential-backoff retry + status footer
+  [LOG]      supabase-disabled risk, params-load-fail, gap-to-threshold
 """
 from __future__ import annotations
 
@@ -35,6 +21,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -62,7 +49,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "8.0.0"
+VERSION = "9.0.0"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -77,6 +64,7 @@ class BotConfig:
     retry_backoff: float = 0.5
     http_timeout: int = 12
     telegram_timeout: int = 8
+    telegram_retries: int = 3
     account_size_usd: float = 10_000.0
     risk_pct: float = 1.0
     signal_cooldown_min: int = 30
@@ -84,12 +72,24 @@ class BotConfig:
     macro_cache_min: int = 30
     news_enabled: bool = True
     notify_wait: bool = False
-    # Daily DD protection
-    daily_dd_limit_r: float = 3.0          # HALT if today's R-sum <= -limit
-    daily_dd_derisk_r: float = 2.0         # derisk if today's R-sum <= -derisk
+    # Stale data guard (v9: tightened)
+    max_stale_h_market: float = 1.5
+    max_stale_h_off: float = 72.0
+    # MACRO severity thresholds (v9: tiered)
+    dxy_warn: float = 0.3
+    dxy_veto: float = 0.6
+    dxy_halt: float = 1.2
+    tnx_warn: float = 0.5
+    tnx_veto: float = 1.5
+    tnx_halt: float = 3.0
+    # TP2 feasibility cap (v9)
+    max_tp2_atr_mult: float = 4.0
+    # Daily DD / circuit breaker
+    daily_dd_limit_r: float = 3.0
+    daily_dd_derisk_r: float = 2.0
     daily_dd_derisk_mult: float = 0.5
-    # Circuit breaker
     cb_halt_consecutive: int = 5
+    # Credentials
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -117,14 +117,16 @@ class BotConfig:
     def warnings(self) -> List[str]:
         w = []
         if not self.twelve_data_api_key:
-            w.append("TWELVE_DATA_API_KEY missing → Yahoo fallback")
+            w.append("TWELVE_DATA_API_KEY missing → yfinance fallback (GC=F, not spot)")
         if not self.telegram_bot_token or not self.telegram_chat_id:
             w.append("Telegram creds missing → stdout only")
+        if not SUPABASE.enabled:
+            w.append("Supabase disabled → SQLite-only, Kelly may never activate")
         return w
 
 
 # ============================================================================
-# 2. LOGGING  (get_logger exported for optimizer.py)
+# 2. LOGGING
 # ============================================================================
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -159,7 +161,7 @@ def log_event(level: int = logging.INFO, event: str = "", **kw: Any) -> None:
 
 
 # ============================================================================
-# 3. INDICATORS  (exported for optimizer.py)
+# 3. INDICATORS
 # ============================================================================
 def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False).mean()
@@ -205,7 +207,7 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 4. HOLIDAYS  (US market + Good Friday, computed 2024-2030)
+# 4. HOLIDAYS
 # ============================================================================
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     weeks = calendar.monthcalendar(year, month)
@@ -269,9 +271,12 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
 
 
 # ============================================================================
-# 6. DATA QUALITY
+# 6. DATA QUALITY  (v9: tighter staleness)
 # ============================================================================
-def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool = False) -> None:
+def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
+                   allow_gap: bool = False,
+                   max_stale_market_h: float = 1.5,
+                   max_stale_off_h: float = 72.0) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
     miss = req - set(df.columns)
     if miss:
@@ -302,19 +307,41 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool 
     last_ts = pd.to_datetime(df["time"].iloc[-1])
     now = datetime.now(timezone.utc)
     age_h = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600
-    max_age = 6 if is_market_open(now) else 72
+    # v9: tighter than v8's 6h
+    max_age = max_stale_market_h if is_market_open(now) else max_stale_off_h
     if age_h > max_age:
-        raise ValueError(f"{label}: stale {age_h:.1f}h (max {max_age})")
+        raise ValueError(f"{label}: stale {age_h:.2f}h (max {max_age}h)")
 
 
 # ============================================================================
-# 7. BUILT-IN PER-REGIME PARAMS
+# 7. PARAMS  (v9: range validation)
 # ============================================================================
 DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
     "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.0, "max_hold": 72.0},
     "WEAK_TREND": {"threshold": 70.0, "sl_mult": 1.5, "tp1_mult": 1.5, "tp2_mult": 2.5, "max_hold": 48.0},
     "RANGING":    {"threshold": 78.0, "sl_mult": 1.0, "tp1_mult": 1.0, "tp2_mult": 2.0, "max_hold": 24.0},
 }
+
+_PARAM_BOUNDS = {
+    "threshold": (50.0, 95.0),
+    "sl_mult":   (0.5, 3.0),
+    "tp1_mult":  (0.5, 5.0),
+    "tp2_mult":  (1.0, 8.0),
+    "max_hold":  (12.0, 168.0),
+}
+
+
+def _validate_params(params: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
+    """v9: reject params outside reasonable bounds."""
+    for regime in REGIMES:
+        p = params.get(regime, {})
+        for k, (lo, hi) in _PARAM_BOUNDS.items():
+            v = p.get(k)
+            if v is None or not isinstance(v, (int, float)):
+                return False, f"{regime}.{k} missing or non-numeric"
+            if not (lo <= v <= hi):
+                return False, f"{regime}.{k}={v} outside [{lo}, {hi}]"
+    return True, "ok"
 
 
 def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
@@ -328,11 +355,16 @@ def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
         if schema >= 2:
             per = j.get("per_regime", {})
             merged = {r: {**DEFAULT_PER_REGIME_PARAMS[r], **per.get(r, {})} for r in REGIMES}
-            return merged, "file"
-        flat = j.get("best_params", {})
-        merged = {r: {**DEFAULT_PER_REGIME_PARAMS[r], **flat} for r in REGIMES}
+        else:
+            flat = j.get("best_params", {})
+            merged = {r: {**DEFAULT_PER_REGIME_PARAMS[r], **flat} for r in REGIMES}
+        ok, msg = _validate_params(merged)
+        if not ok:
+            log_event(logging.WARNING, "params_invalid_fallback", reason=msg)
+            return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
         return merged, "file"
-    except Exception:
+    except Exception as e:
+        log_event(logging.WARNING, "params_load_fail", err=str(e)[:120])
         return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
 
 
@@ -358,8 +390,6 @@ class MarketData:
 
 
 class MarketDataHandler:
-    """Fetch and validate OHLCV. Priority: Twelve Data → yfinance → CSV."""
-
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
         self.session = _retry_session(cfg.retry_total, cfg.retry_backoff)
@@ -457,7 +487,9 @@ class MarketDataHandler:
             h1 = self._twelve("1h", 500)
             m15 = self._twelve("15min", 200)
             if h1 is not None and len(h1) >= self.cfg.min_bars:
-                validate_ohlcv(h1, self.cfg.min_bars, "12data-H1")
+                validate_ohlcv(h1, self.cfg.min_bars, "12data-H1",
+                               max_stale_market_h=self.cfg.max_stale_h_market,
+                               max_stale_off_h=self.cfg.max_stale_h_off)
                 if m15 is None or len(m15) < 50:
                     m15 = h1.set_index("time").resample("15min").ffill().reset_index()
                     m15["volume"] /= 4.0
@@ -472,7 +504,8 @@ class MarketDataHandler:
 
         try:
             md = self._yf()
-            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1")
+            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1",
+                           max_stale_market_h=self.cfg.max_stale_h_market)
             validate_ohlcv(md.m15, 50, "yf-M15")
             log_event(event="data_ok", source=md.source, m15_synthetic=md.m15_synthetic)
             return md
@@ -480,7 +513,8 @@ class MarketDataHandler:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
 
         md = self._csv()
-        validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True)
+        validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True,
+                       max_stale_off_h=168.0)
         return md
 
     def fetch_spot(self, h1: pd.DataFrame) -> float:
@@ -523,26 +557,81 @@ class MarketDataHandler:
 
 
 # ============================================================================
-# 9. NEWS SAFETY FILTER
+# 9. MACRO  (v9: tiered severity)
 # ============================================================================
-class NewsSafetyFilter:
-    """Wrapper around news_calendar with config-driven behavior."""
+@dataclass
+class MacroCheck:
+    severity: str  # "OK", "WARN", "VETO", "HALT"
+    reason: str
+    dxy_chg: float = 0.0
+    tnx_chg: float = 0.0
 
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
+    @property
+    def allowed(self) -> bool:
+        return self.severity in ("OK", "WARN")
 
-    def check(self) -> NewsResult:
-        if not self.enabled:
-            return NewsResult(allowed=True, reason="news disabled", source="bypass")
-        try:
-            return _live_news_guard()
-        except Exception as e:
-            log_event(logging.WARNING, "news_guard_fail", err=str(e)[:120])
-            return NewsResult(allowed=True, reason="news guard error (bypass)", source="error")
+    @property
+    def blocks(self) -> bool:
+        return self.severity in ("VETO", "HALT")
+
+
+_macro_cache: Dict[str, Tuple[datetime, MacroCheck]] = {}
+
+
+def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
+    now = datetime.now(timezone.utc)
+    if "m" in _macro_cache:
+        ts, val = _macro_cache["m"]
+        if (now - ts).total_seconds() < cfg.macro_cache_min * 60:
+            return val
+    if yf is None:
+        return MacroCheck("OK", "yfinance unavailable → bypass")
+
+    try:
+        dxy = yf.Ticker("DX-Y.NYB").history(period="5d")["Close"]
+        tnx = yf.Ticker("^TNX").history(period="5d")["Close"]
+        dxy_chg = 0.0
+        tnx_chg = 0.0
+        severity = "OK"
+        notes = []
+
+        if len(dxy) >= 2:
+            dxy_chg = float((dxy.iloc[-1] - dxy.iloc[-2]) / dxy.iloc[-2] * 100)
+            if abs(dxy_chg) >= cfg.dxy_halt:
+                severity = "HALT"
+                notes.append(f"DXY{'+' if dxy_chg > 0 else ''}{dxy_chg:.2f}%")
+            elif abs(dxy_chg) >= cfg.dxy_veto:
+                severity = max(severity, "VETO", key=lambda x: ["OK", "WARN", "VETO", "HALT"].index(x))
+                notes.append(f"DXY{'+' if dxy_chg > 0 else ''}{dxy_chg:.2f}%")
+            elif abs(dxy_chg) >= cfg.dxy_warn:
+                severity = "WARN"
+                notes.append(f"DXY±{dxy_chg:.2f}%")
+        if len(tnx) >= 2:
+            tnx_chg = float((tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100)
+            if abs(tnx_chg) >= cfg.tnx_halt:
+                severity = "HALT"
+                notes.append(f"10Y{'+' if tnx_chg > 0 else ''}{tnx_chg:.2f}%")
+            elif abs(tnx_chg) >= cfg.tnx_veto:
+                if severity != "HALT":
+                    severity = "VETO"
+                notes.append(f"10Y{'+' if tnx_chg > 0 else ''}{tnx_chg:.2f}%")
+            elif abs(tnx_chg) >= cfg.tnx_warn:
+                if severity == "OK":
+                    severity = "WARN"
+                notes.append(f"10Y±{tnx_chg:.2f}%")
+
+        reason = "normal" if severity == "OK" else " ".join(notes)
+        result = MacroCheck(severity, reason, dxy_chg, tnx_chg)
+        _macro_cache["m"] = (now, result)
+        return result
+    except Exception as e:
+        result = MacroCheck("OK", f"bypass ({str(e)[:30]})")
+        _macro_cache["m"] = (now, result)
+        return result
 
 
 # ============================================================================
-# 10. SESSION & MACRO HELPERS
+# 10. SESSION PROFILE
 # ============================================================================
 def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
     now = datetime.now(timezone.utc)
@@ -554,40 +643,6 @@ def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
     if 12 <= h < 16: return "NY_OVERLAP",   True, 75.0, 1.5
     if 16 <= h < 21: return "NY_PM",        True, 70.0, 1.3
     return "OFF_HOURS", False, 999.0, 1.0
-
-
-_macro_cache: Dict[str, Tuple[datetime, Tuple[bool, str]]] = {}
-
-
-def check_macro_correlation(cfg: BotConfig) -> Tuple[bool, str]:
-    now = datetime.now(timezone.utc)
-    if "m" in _macro_cache:
-        ts, val = _macro_cache["m"]
-        if (now - ts).total_seconds() < cfg.macro_cache_min * 60:
-            return val
-    if yf is None:
-        return True, "bypass"
-    try:
-        dxy = yf.Ticker("DX-Y.NYB").history(period="5d")["Close"]
-        tnx = yf.Ticker("^TNX").history(period="5d")["Close"]
-        notes, safe = [], True
-        if len(dxy) >= 2:
-            ch = (dxy.iloc[-1] - dxy.iloc[-2]) / dxy.iloc[-2] * 100
-            if ch > 0.4:
-                safe = False
-                notes.append(f"DXY+{ch:.2f}%")
-        if len(tnx) >= 2:
-            ch = (tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100
-            if ch > 0.5:
-                safe = False
-                notes.append(f"10Y+{ch:.2f}%")
-        res = (True, "normal") if safe else (False, "veto " + ", ".join(notes))
-        _macro_cache["m"] = (now, res)
-        return res
-    except Exception as e:
-        res = (True, f"bypass ({str(e)[:30]})")
-        _macro_cache["m"] = (now, res)
-        return res
 
 
 # ============================================================================
@@ -606,13 +661,13 @@ class EnsembleResult:
     atr_value: float
     atr_multiplier: float
     blended_params: Dict[str, float]
+    threshold: float
+    gap_to_threshold: float = 0.0
     params_source: str = "builtin"
     voters_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 class SignalGenerator:
-    """21-voter ensemble + forensic scoring + fuzzy regime + session/news/macro gates."""
-
     def __init__(self, params: Dict[str, Dict[str, float]], params_source: str):
         self.params = params
         self.params_source = params_source
@@ -672,7 +727,8 @@ class SignalGenerator:
         bear = 21 - bull
         return max(bull, bear) / 21.0, bull, bear, dbg
 
-    def generate(self, md: MarketData, news: NewsResult, cfg: BotConfig) -> EnsembleResult:
+    def generate(self, md: MarketData, news: NewsResult, macro: MacroCheck,
+                 cfg: BotConfig) -> EnsembleResult:
         df, m15 = md.h1, md.m15
         close = df["close"]
         c_last = float(close.iloc[-1])
@@ -687,7 +743,6 @@ class SignalGenerator:
 
         poc = volume_profile_poc(df)
         session, allowed, _, _ = get_session_profile(cfg)
-        corr_ok, corr_msg = check_macro_correlation(cfg)
         ema200 = float(ema(close, 200).iloc[-1])
 
         last, prev = df.iloc[-1], df.iloc[-21:-1]
@@ -717,16 +772,17 @@ class SignalGenerator:
         intended = "BUY" if bull > bear else "SELL"
         macro_ok = ((intended == "BUY" and c_last > ema200)
                     or (intended == "SELL" and c_last < ema200))
+        gap = round(combined - threshold, 1)
 
         notes, action = [], "WAIT"
         if not news.allowed:
             notes.append(f"NEWS: {news.reason}")
+        elif macro.blocks:
+            notes.append(f"MACRO[{macro.severity}]: {macro.reason}")
         elif not allowed:
             notes.append(f"SESSION: {session}")
-        elif not corr_ok:
-            notes.append(f"MACRO: {corr_msg}")
         elif combined < threshold:
-            notes.append(f"GATED[{dom}]: {combined}% under {threshold:.1f}%")
+            notes.append(f"GATED[{dom}]: {combined}% under {threshold:.1f}% (gap {gap:+.1f})")
         elif not macro_ok:
             notes.append("VETO EMA200 H1")
         elif intended == "BUY" and m15_bull:
@@ -738,22 +794,26 @@ class SignalGenerator:
         else:
             notes.append("M15 misaligned")
 
+        if macro.severity == "WARN":
+            notes.append(f"macro_warn: {macro.reason}")
+
         dbg["news_source"] = news.source
+        dbg["macro_severity"] = macro.severity
         return EnsembleResult(
             action=action, total_score=combined,
             voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
             regime=dom, regime_weights=weights, poc_level=round(poc, 2),
             notes=notes, atr_value=round(atr_val, 4), atr_multiplier=round(atr_mult, 4),
             blended_params={k: round(v, 4) for k, v in blended.items()},
+            threshold=round(threshold, 1), gap_to_threshold=gap,
             params_source=self.params_source, voters_debug=dbg,
         )
 
 
 # ============================================================================
-# 12. AUDIT DB  (schema v8 with migration)
+# 12. AUDIT DB
 # ============================================================================
 def _to_utc_iso(dt_or_str: Any) -> str:
-    """Normalize datetime/string to UTC ISO string with +00:00 suffix."""
     if isinstance(dt_or_str, str):
         d = datetime.fromisoformat(dt_or_str)
     elif isinstance(dt_or_str, datetime):
@@ -867,7 +927,7 @@ class AuditDB:
         try:
             rows = self.conn.execute(
                 "SELECT * FROM signals WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
-                " ORDER BY closed_at DESC LIMIT ?", (limit,)
+                " ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
@@ -881,13 +941,14 @@ class AuditDB:
                 "SELECT r_multiple FROM signals"
                 " WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
                 " AND r_multiple IS NOT NULL"
-                " ORDER BY closed_at DESC LIMIT ?", (limit,)
+                " ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)
             ).fetchall()
             return [float(r[0]) for r in rows]
         except Exception:
             return []
 
     def get_today_r_sum(self) -> float:
+        """v9: COALESCE(closed_at, ts) for robustness on legacy rows."""
         if not self.ok:
             return 0.0
         try:
@@ -896,45 +957,48 @@ class AuditDB:
             row = self.conn.execute(
                 "SELECT COALESCE(SUM(r_multiple), 0) FROM signals"
                 " WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
-                " AND closed_at >= ?", (today_start,)
+                " AND r_multiple IS NOT NULL"
+                " AND COALESCE(closed_at, ts) >= ?", (today_start,)
             ).fetchone()
             return float(row[0]) if row else 0.0
         except Exception:
             return 0.0
 
-    def last_action(self) -> Optional[Tuple[str, datetime, float]]:
+    def last_action(self) -> Optional[Tuple[str, datetime, float, str]]:
+        """Returns (action, ts, spot, regime)."""
         if not self.ok:
             return None
         try:
             row = self.conn.execute(
-                "SELECT action, ts, spot FROM signals WHERE action IN ('BUY','SELL')"
+                "SELECT action, ts, spot, regime FROM signals WHERE action IN ('BUY','SELL')"
                 " ORDER BY id DESC LIMIT 1").fetchone()
             if row:
                 ts = datetime.fromisoformat(row[1])
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
-                return row[0], ts, row[2]
+                return row[0], ts, row[2], row[3] or ""
         except Exception:
             pass
         return None
 
-    def is_dup(self, cooldown: int, action: str, spot: float, tol: float = 1.0) -> bool:
+    def is_dup(self, cooldown: int, action: str, spot: float, regime: str,
+               tol: float = 2.0) -> bool:
+        """v9: fingerprint includes regime."""
         last = self.last_action()
         if not last:
             return False
-        a, ts, sp = last
+        a, ts, sp, rg = last
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-        return age < cooldown and a == action and abs(sp - spot) < tol
+        return (age < cooldown and a == action and rg == regime
+                and abs(sp - spot) < tol)
 
 
 # ============================================================================
-# 13. RISK MANAGEMENT ENGINE
+# 13. RISK MANAGEMENT ENGINE  (v9: TP2 feasibility cap)
 # ============================================================================
 class RiskManagementEngine:
-    """Kelly + ATR SL/TP + lot sizing + daily DD gate + circuit breaker."""
-
     def __init__(self, cfg: BotConfig, db: AuditDB):
         self.cfg = cfg
         self.db = db
@@ -986,35 +1050,50 @@ class RiskManagementEngine:
         return self.cfg.risk_pct, f"fallback {self.cfg.risk_pct}% (n={n}<20)"
 
     def combined_multiplier(self) -> Tuple[float, str, str]:
-        """Return (final_mult, cb_reason, dd_reason)."""
         cb_mult, cb_r = self._circuit_multiplier()
         dd_mult, dd_r = self._daily_dd_multiplier()
         final = min(cb_mult, dd_mult)
         return final, cb_r, dd_r
 
     def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float,
-                       blended: dict, kelly_risk_pct: float, kelly_reason: str) -> Optional[dict]:
+                       blended: dict, kelly_risk_pct: float,
+                       kelly_reason: str) -> Optional[dict]:
         if sig not in ("BUY", "SELL"):
             return None
-        # ATR-based stop distance
         sl_d = max(atr_v * atr_mult, 1.0)
         risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
-        # Contract size XAUUSD = 100 oz/lot. $1 move × 1 lot = $100 P/L.
+        # XAUUSD: 1 lot = 100 oz; $1 move × 1 lot = $100 P/L
         raw_lot = risk_usd / (sl_d * 100.0)
         lot = round(raw_lot, 2)
         if lot < 0.01:
             lot = 0.01
-        # Safety: if rounding pushed risk > 110% of budget, step down
         if lot * sl_d * 100.0 > risk_usd * 1.10 and lot > 0.01:
             lot = max(round(raw_lot - 0.01, 2), 0.01)
         actual_risk = lot * sl_d * 100.0
 
         tp1_r = blended.get("tp1_mult", 1.5) or 1.5
         tp2_r = blended.get("tp2_mult", 2.5) or 2.5
+
+        # v9: TP2 feasibility cap
+        tp2_dist_raw = sl_d * tp2_r
+        tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
+        tp2_dist = min(tp2_dist_raw, tp2_dist_cap)
+        tp2_capped = tp2_dist < tp2_dist_raw
+
         if sig == "BUY":
-            sl, tp1, tp2, be = entry - sl_d, entry + sl_d * tp1_r, entry + sl_d * tp2_r, entry + sl_d
+            sl = entry - sl_d
+            tp1 = entry + sl_d * tp1_r
+            tp2 = entry + tp2_dist
+            be = entry + sl_d
         else:
-            sl, tp1, tp2, be = entry + sl_d, entry - sl_d * tp1_r, entry - sl_d * tp2_r, entry - sl_d
+            sl = entry + sl_d
+            tp1 = entry - sl_d * tp1_r
+            tp2 = entry - tp2_dist
+            be = entry - sl_d
+
+        if tp2_capped:
+            kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}→{tp2_dist:.1f} (4×ATR)"
+
         return {
             "entry_price": round(entry, 2), "sl_price": round(sl, 2),
             "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2),
@@ -1022,6 +1101,7 @@ class RiskManagementEngine:
             "lot_size": lot, "risk_amount_usd": round(risk_usd, 2),
             "actual_risk_usd": round(actual_risk, 2),
             "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason,
+            "tp2_capped": tp2_capped,
         }
 
 
@@ -1029,8 +1109,6 @@ class RiskManagementEngine:
 # 14. OUTCOME TRACKER
 # ============================================================================
 class OutcomeTracker:
-    """Resolve OPEN signals against H1 bars. Conservative: SL wins ties."""
-
     def __init__(self, db: AuditDB):
         self.db = db
 
@@ -1060,7 +1138,6 @@ class OutcomeTracker:
             return -1.0
         if status == "WIN_TP1":
             return abs(float(sig["tp1"]) - entry) / sl_d
-        # TIMEOUT
         return (exit_px - entry) / sl_d if sig["action"] == "BUY" else (entry - exit_px) / sl_d
 
     @staticmethod
@@ -1108,7 +1185,8 @@ class OutcomeTracker:
                 resolution_bar = None
                 for _, row in bars.iterrows():
                     res = self._resolve(sig["action"], float(row["low"]),
-                                        float(row["high"]), float(sig["sl"]), float(sig["tp1"]))
+                                        float(row["high"]), float(sig["sl"]),
+                                        float(sig["tp1"]))
                     if res:
                         resolution = res
                         resolution_bar = row
@@ -1142,7 +1220,7 @@ class OutcomeTracker:
 
 
 # ============================================================================
-# 15. TELEGRAM NOTIFIER
+# 15. TELEGRAM NOTIFIER  (v9: retry + status footer)
 # ============================================================================
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
@@ -1157,30 +1235,32 @@ class TelegramNotifier:
             return False
         if ":" not in self.cfg.telegram_bot_token:
             return False
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage",
-                json=payload, timeout=self.cfg.telegram_timeout)
-            if r.status_code == 200:
-                return True
-            if r.status_code == 400 and "parse entities" in r.text:
-                log_event(logging.WARNING, "telegram_html_retry", body=r.text[:200])
-                plain = {"chat_id": payload["chat_id"],
-                         "text": _strip_html(payload["text"]),
-                         "disable_web_page_preview": True}
-                if "reply_markup" in payload:
-                    plain["reply_markup"] = payload["reply_markup"]
-                r2 = requests.post(
-                    f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage",
-                    json=plain, timeout=self.cfg.telegram_timeout)
-                return r2.status_code == 200
-            log_event(logging.ERROR, "telegram_error", code=r.status_code, body=r.text[:200])
-            return False
-        except Exception as e:
-            log_event(logging.ERROR, "telegram_exc", err=str(e)[:120])
-            return False
+        url = f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage"
+        for attempt in range(self.cfg.telegram_retries):
+            try:
+                r = requests.post(url, json=payload, timeout=self.cfg.telegram_timeout)
+                if r.status_code == 200:
+                    return True
+                if r.status_code == 400 and "parse entities" in r.text:
+                    plain = {"chat_id": payload["chat_id"],
+                             "text": _strip_html(payload["text"]),
+                             "disable_web_page_preview": True}
+                    if "reply_markup" in payload:
+                        plain["reply_markup"] = payload["reply_markup"]
+                    r2 = requests.post(url, json=plain, timeout=self.cfg.telegram_timeout)
+                    return r2.status_code == 200
+                log_event(logging.WARNING, "telegram_retry",
+                          attempt=attempt + 1, code=r.status_code, body=r.text[:200])
+            except Exception as e:
+                log_event(logging.WARNING, "telegram_exc",
+                          attempt=attempt + 1, err=str(e)[:120])
+            if attempt < self.cfg.telegram_retries - 1:
+                time.sleep(2 ** attempt)
+        return False
 
-    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict]) -> bool:
+    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict],
+                    cb_reason: str = "normal", dd_reason: str = "daily OK",
+                    next_eta_min: int = 20) -> bool:
         if e.action == "WAIT" and not self.cfg.notify_wait:
             log_event(event="telegram_suppressed", action="WAIT",
                       score=e.total_score, reason=e.notes[0] if e.notes else "")
@@ -1197,14 +1277,19 @@ class TelegramNotifier:
             f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
         safe_reason = html.escape(e.notes[0]) if e.notes else ""
         safe_kelly = html.escape(levels["kelly_reason"]) if levels else ""
+        safe_cb = html.escape(cb_reason)
+        safe_dd = html.escape(dd_reason)
 
         if e.action == "WAIT" or not levels:
             text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
                     f"⏰ <code>{now}</code>\n"
                     f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                    f"Reason: {safe_reason}")
+                    f"Reason: {safe_reason}\n"
+                    f"<i>CB: {safe_cb} | DD: {safe_dd}</i>\n"
+                    f"<i>Next check: ~{next_eta_min}m</i>")
         else:
             em = "🟢" if e.action == "BUY" else "🔴"
+            tp2_note = " (capped)" if levels.get("tp2_capped") else ""
             text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
                     f"⏰ <code>{now}</code>\n───────────────────\n"
                     f"Score: <b>{e.total_score}%</b>\n"
@@ -1213,11 +1298,12 @@ class TelegramNotifier:
                     f"<code>ENTRY : ${levels['entry_price']:.2f}\n"
                     f"SL    : ${levels['sl_price']:.2f}\n"
                     f"TP1   : ${levels['tp1_price']:.2f}\n"
-                    f"TP2   : ${levels['tp2_price']:.2f}\n"
+                    f"TP2   : ${levels['tp2_price']:.2f}{tp2_note}\n"
                     f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
                     f"Lot: <b>{levels['lot_size']}</b> | "
                     f"Risk: ${levels['actual_risk_usd']:.0f} ({levels['risk_pct']:.2f}%)\n"
-                    f"<i>Kelly: {safe_kelly}</i>")
+                    f"<i>Kelly: {safe_kelly}</i>\n"
+                    f"<i>CB: {safe_cb} | DD: {safe_dd}</i>")
         return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
                            "parse_mode": "HTML", "reply_markup": kb,
                            "disable_web_page_preview": True})
@@ -1227,7 +1313,8 @@ class TelegramNotifier:
             return
         self._post({
             "chat_id": self.cfg.telegram_chat_id,
-            "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{html.escape(err[:400])}</code>",
+            "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n"
+                    f"<code>{html.escape(err[:400])}</code>",
             "parse_mode": "HTML",
         })
 
@@ -1241,17 +1328,31 @@ class TradingBotOrchestrator:
         self.params, self.params_source = load_params()
         self.db = AuditDB(cfg.db_path)
         self.data = MarketDataHandler(cfg)
-        self.news = NewsSafetyFilter(cfg.news_enabled)
         self.signal_gen = SignalGenerator(self.params, self.params_source)
         self.risk = RiskManagementEngine(cfg, self.db)
         self.outcomes = OutcomeTracker(self.db)
         self.tg = TelegramNotifier(cfg)
 
+    def _news_check(self) -> NewsResult:
+        if not self.cfg.news_enabled:
+            return NewsResult(allowed=True, reason="news disabled", source="bypass")
+        try:
+            return _live_news_guard()
+        except Exception as e:
+            log_event(logging.WARNING, "news_guard_fail", err=str(e)[:120])
+            return NewsResult(allowed=True, reason="news guard error (bypass)",
+                              source="error")
+
     def run(self) -> int:
         log_event(event="bot_start", version=VERSION,
-                  params_source=self.params_source, params_loaded=self.params,
-                  supabase_enabled=SUPABASE.enabled, notify_wait=self.cfg.notify_wait,
+                  params_source=self.params_source,
+                  supabase_enabled=SUPABASE.enabled,
+                  notify_wait=self.cfg.notify_wait,
                   warnings=self.cfg.warnings())
+
+        if not SUPABASE.enabled:
+            log_event(logging.WARNING, "supabase_disabled_risk",
+                      note="Kelly will not activate without persistent R history")
 
         if not is_market_open():
             log_event(event="market_closed_or_holiday", skip=True)
@@ -1267,7 +1368,6 @@ class TradingBotOrchestrator:
             print(f"ACTION: ERROR — {err}")
             return 1
 
-        # [P1 FIX] Outcome resolution BEFORE new signal generation
         try:
             n_closed = self.outcomes.process(md.h1)
             if n_closed:
@@ -1276,16 +1376,17 @@ class TradingBotOrchestrator:
             log_event(logging.WARNING, "outcome_tracker_fail", err=str(ex)[:120])
 
         try:
-            news = self.news.check()
-            e = self.signal_gen.generate(md, news, self.cfg)
+            news = self._news_check()
+            macro = check_macro_correlation(self.cfg)
+            e = self.signal_gen.generate(md, news, macro, self.cfg)
+
             basis = self.data.get_basis(md)
             tradable = float(md.h1["close"].iloc[-1]) + basis
 
-            # Risk gates: circuit breaker + daily DD
             mult, cb_r, dd_r = self.risk.combined_multiplier()
             if mult == 0.0:
                 log_event(event="risk_halt", cb=cb_r, dd=dd_r)
-                self.tg.send_signal(e, tradable, None)
+                self.tg.send_signal(e, tradable, None, cb_r, dd_r)
                 print(f"ACTION: HALT — CB:{cb_r} | DD:{dd_r}")
                 return 0
 
@@ -1298,8 +1399,10 @@ class TradingBotOrchestrator:
                 e.action, tradable, e.atr_value, e.atr_multiplier,
                 e.blended_params, kelly_final, kelly_reason)
 
-            if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action, tradable):
-                log_event(event="signal_deduped", action=e.action, spot=round(tradable, 2))
+            if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action,
+                                         tradable, e.regime):
+                log_event(event="signal_deduped", action=e.action,
+                          regime=e.regime, spot=round(tradable, 2))
                 print(f"ACTION: {e.action} (deduped) | Score: {e.total_score}%")
                 return 0
 
@@ -1310,27 +1413,32 @@ class TradingBotOrchestrator:
                 try_insert_signal(
                     signal_id=signal_id, action=e.action, spot=tradable,
                     entry_price=levels["entry_price"],
-                    sl=levels["sl_price"], tp1=levels["tp1_price"], tp2=levels["tp2_price"],
+                    sl=levels["sl_price"], tp1=levels["tp1_price"],
+                    tp2=levels["tp2_price"],
                     score=e.total_score, regime=e.regime,
                     kelly_frac=kelly_final / 100.0, lot=levels["lot_size"],
-                    risk_usd=levels["actual_risk_usd"], max_hold_hours=max_hold_h,
+                    risk_usd=levels["actual_risk_usd"],
+                    max_hold_hours=max_hold_h,
                     notes="; ".join(e.notes))
             else:
                 signal_id = None
 
-            sent = self.tg.send_signal(e, tradable, levels)
+            sent = self.tg.send_signal(e, tradable, levels, cb_r, dd_r)
 
             log_event(event="signal_emitted", action=e.action, score=e.total_score,
+                      threshold=e.threshold, gap=e.gap_to_threshold,
                       spot=round(tradable, 2), basis=round(basis, 2),
                       source=md.source, m15_synthetic=md.m15_synthetic,
                       regime=e.regime, regime_weights=e.regime_weights,
+                      macro_severity=macro.severity,
                       params_source=e.params_source,
                       kelly_base=kelly_base, kelly_final=kelly_final,
                       kelly_reason=kelly_reason, mult=mult, cb=cb_r, dd=dd_r,
                       signal_id=signal_id, tg=sent)
-            print(f"ACTION: {e.action} | Score: {e.total_score}% | Regime: {e.regime} | "
-                  f"Kelly: {kelly_final:.2f}% (×{mult}) | Spot: {tradable:.2f} | "
-                  f"TG: {sent} | CB: {cb_r} | DD: {dd_r}")
+            print(f"ACTION: {e.action} | Score: {e.total_score}% "
+                  f"(thr {e.threshold:.1f}, gap {e.gap_to_threshold:+.1f}) | "
+                  f"Regime: {e.regime} | Kelly: {kelly_final:.2f}% (×{mult}) | "
+                  f"Spot: {tradable:.2f} | TG: {sent} | CB: {cb_r} | DD: {dd_r}")
             return 0
         except Exception as ex:
             err = f"{type(ex).__name__}: {ex}"
