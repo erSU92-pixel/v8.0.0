@@ -3,6 +3,10 @@ news_calendar.py — Live macro calendar (ForexFactory feed).
 ============================================================
 Free, no auth. Weekly calendar with TTL cache.
 Returns blackout windows around High-impact USD events.
+
+v9.2.0: Static fallback is now labeled "APPROXIMATE-STATIC" and the
+        "clear" reason makes it explicit the API was unavailable.
+        Prevents users from trusting the hardcoded windows as live data.
 """
 from __future__ import annotations
 
@@ -24,13 +28,15 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Static fallback (recurring windows) — used when API unavailable
+# NOTE: These are APPROXIMATE. NFP is 1st Friday of month (not every Friday),
+#       CPI is monthly (not weekly), FOMC is 8x/year. DO NOT trust blindly.
 # ---------------------------------------------------------------------------
 STATIC_BLACKOUTS: List[Tuple[int, int, int, str]] = [
     # (weekday, start_h_utc, end_h_utc, label)
-    (2, 18, 20, "FOMC"),
-    (1, 12, 13, "CPI"),
-    (3, 12, 13, "PPI"),
-    (4, 12, 14, "NFP"),
+    (2, 18, 20, "FOMC"),   # Wed 18-20 UTC (approximate)
+    (1, 12, 13, "CPI"),    # Tue 12-13 UTC (approximate)
+    (3, 12, 13, "PPI"),    # Thu 12-13 UTC (approximate)
+    (4, 12, 14, "NFP"),    # Fri 12-14 UTC (approximate)
 ]
 
 TIER1_KEYWORDS = ["FOMC", "FED", "NONFARM", "NFP", "CPI", "INTEREST RATE", "POWELL"]
@@ -127,7 +133,7 @@ def _save_cache(events: List[NewsEvent]) -> None:
 
 
 def _fetch_ff() -> List[NewsEvent]:
-    r = requests.get(FF_URL, timeout=12, headers={"User-Agent": "XAUUSD-Quant/8.0"})
+    r = requests.get(FF_URL, timeout=12, headers={"User-Agent": "XAUUSD-Quant/9.2.0"})
     r.raise_for_status()
     raw = r.json()
     out: List[NewsEvent] = []
@@ -193,7 +199,8 @@ def _static_blackout(now: datetime) -> Optional[NewsBlackout]:
         if now.weekday() == wd and s <= now.hour < e:
             start = now.replace(hour=s, minute=0, second=0, microsecond=0)
             end = now.replace(hour=e, minute=0, second=0, microsecond=0)
-            return NewsBlackout(start=start, end=end, label=f"STATIC {label}")
+            return NewsBlackout(start=start, end=end,
+                                label=f"APPROXIMATE-STATIC {label}")
     return None
 
 
@@ -242,7 +249,11 @@ def check_news_guard(now: Optional[datetime] = None) -> NewsResult:
             source="static",
             active_blackout=static_bo,
         )
-    return NewsResult(allowed=True, reason="static windows clear", source="static")
+    return NewsResult(
+        allowed=True,
+        reason="APPROXIMATE static windows clear (live API unavailable)",
+        source="static",
+    )
 
 
 def describe_next_events(limit: int = 3) -> str:
