@@ -91,6 +91,9 @@ jobs:
           DAILY_DD_DERISK_MULT: ${{ vars.DAILY_DD_DERISK_MULT || '0.5' }}
           CB_HALT_CONSECUTIVE:  ${{ vars.CB_HALT_CONSECUTIVE || '3' }}
           NEWS_ENABLED:         ${{ vars.NEWS_ENABLED || '1' }}
+          NOTIFY_WAIT:          ${{ vars.NOTIFY_WAIT || '0' }}
+          NOTIFY_SKIP:          ${{ vars.NOTIFY_SKIP || '0' }}
+          NOTIFY_HALT:          ${{ vars.NOTIFY_HALT || '0' }}
         run: python bot.py
 
       - name: Save persistent cache
