@@ -1,4 +1,4 @@
-name: XAUUSD Signal Bot v8
+name: XAUUSD Signal Bot v9
 
 on:
   schedule:
@@ -76,20 +76,21 @@ jobs:
 
       - name: Run signal bot
         env:
-          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
-          ACCOUNT_SIZE_USD:    ${{ vars.ACCOUNT_SIZE_USD || '10000' }}
-          RISK_PCT:            ${{ vars.RISK_PCT || '1.0' }}
-          KELLY_FRACTION:      ${{ vars.KELLY_FRACTION || '0.5' }}
-          KELLY_CAP_PCT:       ${{ vars.KELLY_CAP_PCT || '3.0' }}
-          DAILY_DD_LIMIT_R:    ${{ vars.DAILY_DD_LIMIT_R || '3.0' }}
-          DAILY_DD_DERISK_R:   ${{ vars.DAILY_DD_DERISK_R || '2.0' }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:         ${{ secrets.SUPABASE_KEY }}
+          ACCOUNT_SIZE_USD:     ${{ vars.ACCOUNT_SIZE_USD || '1000' }}
+          RISK_PCT:             ${{ vars.RISK_PCT || '1.0' }}
+          MAX_LOT_RISK_PCT:     ${{ vars.MAX_LOT_RISK_PCT || '2.5' }}
+          KELLY_FRACTION:       ${{ vars.KELLY_FRACTION || '0.5' }}
+          KELLY_CAP_PCT:        ${{ vars.KELLY_CAP_PCT || '3.0' }}
+          DAILY_DD_LIMIT_R:     ${{ vars.DAILY_DD_LIMIT_R || '2.0' }}
+          DAILY_DD_DERISK_R:    ${{ vars.DAILY_DD_DERISK_R || '1.0' }}
           DAILY_DD_DERISK_MULT: ${{ vars.DAILY_DD_DERISK_MULT || '0.5' }}
-          CB_HALT_CONSECUTIVE: ${{ vars.CB_HALT_CONSECUTIVE || '5' }}
-          NEWS_ENABLED:        ${{ vars.NEWS_ENABLED || '1' }}
+          CB_HALT_CONSECUTIVE:  ${{ vars.CB_HALT_CONSECUTIVE || '3' }}
+          NEWS_ENABLED:         ${{ vars.NEWS_ENABLED || '1' }}
         run: python bot.py
 
       - name: Save persistent cache
