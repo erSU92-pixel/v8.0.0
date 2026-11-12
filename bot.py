@@ -1,15 +1,10 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.0.0 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.1.0 PRODUCTION
 ================================================================
-Changes v8.0.0 → v9.0.0 (all surgical, additive — no strategy change):
-  [MACRO]    Tiered severity: OK / WARN / VETO / HALT
-  [STALE]    Tighter H1 staleness gate (1.5h during market hours)
-  [TP2]      TP2 distance capped at 4× ATR (feasibility for 72h hold)
-  [PARAMS]   Range validation on params.json load
-  [DEDUP]    Fingerprint includes regime
-  [DAILY_R]  COALESCE(closed_at, ts) for robust daily R-sum
-  [TELEGRAM] 3× exponential-backoff retry + status footer
-  [LOG]      supabase-disabled risk, params-load-fail, gap-to-threshold
+Changes v9.0.0 → v9.1.0:
+  [DATA]     Added Dukascopy (free, keyless, spot XAUUSD) as fallback #2
+  [SPOT]     Added gold-api.com (free, keyless) as spot price fallback #2
+  [ROBUST]   If Twelve Data quota exhausted, bot survives on free feeds.
 """
 from __future__ import annotations
 
@@ -39,6 +34,11 @@ except ImportError:
     yf = None
 
 try:
+    import dukascopy_python
+except ImportError:
+    dukascopy_python = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -49,7 +49,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.0.0"
+VERSION = "9.1.0"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -72,24 +72,19 @@ class BotConfig:
     macro_cache_min: int = 30
     news_enabled: bool = True
     notify_wait: bool = False
-    # Stale data guard (v9: tightened)
     max_stale_h_market: float = 1.5
     max_stale_h_off: float = 72.0
-    # MACRO severity thresholds (v9: tiered)
     dxy_warn: float = 0.3
     dxy_veto: float = 0.6
     dxy_halt: float = 1.2
     tnx_warn: float = 0.5
     tnx_veto: float = 1.5
     tnx_halt: float = 3.0
-    # TP2 feasibility cap (v9)
     max_tp2_atr_mult: float = 4.0
-    # Daily DD / circuit breaker
     daily_dd_limit_r: float = 3.0
     daily_dd_derisk_r: float = 2.0
     daily_dd_derisk_mult: float = 0.5
     cb_halt_consecutive: int = 5
-    # Credentials
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -117,7 +112,7 @@ class BotConfig:
     def warnings(self) -> List[str]:
         w = []
         if not self.twelve_data_api_key:
-            w.append("TWELVE_DATA_API_KEY missing → yfinance fallback (GC=F, not spot)")
+            w.append("TWELVE_DATA_API_KEY missing → will use Dukascopy/Yahoo")
         if not self.telegram_bot_token or not self.telegram_chat_id:
             w.append("Telegram creds missing → stdout only")
         if not SUPABASE.enabled:
@@ -253,9 +248,6 @@ def is_holiday(d: date) -> bool:
     return d in _HOLIDAYS.get(d.year, set())
 
 
-# ============================================================================
-# 5. MARKET HOURS
-# ============================================================================
 def is_market_open(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     if is_holiday(now.date()):
@@ -271,7 +263,7 @@ def is_market_open(now: Optional[datetime] = None) -> bool:
 
 
 # ============================================================================
-# 6. DATA QUALITY  (v9: tighter staleness)
+# 5. DATA QUALITY
 # ============================================================================
 def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
                    allow_gap: bool = False,
@@ -307,14 +299,13 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
     last_ts = pd.to_datetime(df["time"].iloc[-1])
     now = datetime.now(timezone.utc)
     age_h = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600
-    # v9: tighter than v8's 6h
     max_age = max_stale_market_h if is_market_open(now) else max_stale_off_h
     if age_h > max_age:
         raise ValueError(f"{label}: stale {age_h:.2f}h (max {max_age}h)")
 
 
 # ============================================================================
-# 7. PARAMS  (v9: range validation)
+# 6. PARAMS
 # ============================================================================
 DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
     "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.0, "max_hold": 72.0},
@@ -332,7 +323,6 @@ _PARAM_BOUNDS = {
 
 
 def _validate_params(params: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
-    """v9: reject params outside reasonable bounds."""
     for regime in REGIMES:
         p = params.get(regime, {})
         for k, (lo, hi) in _PARAM_BOUNDS.items():
@@ -369,7 +359,7 @@ def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
 
 
 # ============================================================================
-# 8. MARKET DATA HANDLER
+# 7. MARKET DATA HANDLER (with Dukascopy & Gold-API fallbacks)
 # ============================================================================
 def _retry_session(retries: int, backoff: float) -> requests.Session:
     s = requests.Session()
@@ -418,6 +408,56 @@ class MarketDataHandler:
         else:
             df["volume"] = 1000.0
         return df.sort_values("time").reset_index(drop=True)
+
+    def _dukascopy(self) -> Optional[MarketData]:
+        if dukascopy_python is None:
+            return None
+        try:
+            end = datetime.now(timezone.utc)
+            start_h1 = end - timedelta(days=30)
+            start_m15 = end - timedelta(days=5)
+            
+            df_h1 = dukascopy_python.fetch(
+                instrument="XAU/USD", interval="1HOUR", offer_side="BID",
+                start=start_h1, end=end
+            )
+            df_m15 = dukascopy_python.fetch(
+                instrument="XAU/USD", interval="15MIN", offer_side="BID",
+                start=start_m15, end=end
+            )
+            
+            if df_h1 is None or len(df_h1) < self.cfg.min_bars:
+                return None
+                
+            df_h1 = df_h1.reset_index().rename(columns={
+                "timestamp": "time", "open": "open", "high": "high", 
+                "low": "low", "close": "close", "volume": "volume"
+            })
+            df_h1["time"] = pd.to_datetime(df_h1["time"], utc=True).dt.tz_localize(None)
+            if "volume" not in df_h1.columns:
+                df_h1["volume"] = 1000.0
+            
+            if df_m15 is None or len(df_m15) < 50:
+                m15 = df_h1.set_index("time").resample("15min").ffill().reset_index()
+                m15["volume"] /= 4.0
+                synth = True
+            else:
+                m15 = df_m15.reset_index().rename(columns={
+                    "timestamp": "time", "open": "open", "high": "high", 
+                    "low": "low", "close": "close", "volume": "volume"
+                })
+                m15["time"] = pd.to_datetime(m15["time"], utc=True).dt.tz_localize(None)
+                if "volume" not in m15.columns:
+                    m15["volume"] = 1000.0
+                synth = False
+                
+            df_h1 = df_h1.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+            m15 = m15.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+            
+            return MarketData(df_h1, m15, "dukascopy", m15_synthetic=synth)
+        except Exception as e:
+            log_event(logging.WARNING, "dukascopy_fail", err=str(e)[:120])
+            return None
 
     def _yf(self) -> MarketData:
         if yf is None:
@@ -483,6 +523,7 @@ class MarketDataHandler:
         return MarketData(df, m15, "csv", m15_synthetic=True)
 
     def fetch(self) -> MarketData:
+        # 1. Twelve Data
         try:
             h1 = self._twelve("1h", 500)
             m15 = self._twelve("15min", 200)
@@ -502,6 +543,19 @@ class MarketDataHandler:
         except Exception as e:
             log_event(logging.WARNING, "twelvedata_fail", err=str(e)[:120])
 
+        # 2. Dukascopy (Free, Keyless)
+        try:
+            md = self._dukascopy()
+            if md is not None:
+                validate_ohlcv(md.h1, self.cfg.min_bars, "duka-H1",
+                               max_stale_market_h=self.cfg.max_stale_h_market)
+                validate_ohlcv(md.m15, 50, "duka-M15")
+                log_event(event="data_ok", source=md.source, m15_synthetic=md.m15_synthetic)
+                return md
+        except Exception as e:
+            log_event(logging.WARNING, "dukascopy_validation_fail", err=str(e)[:120])
+
+        # 3. yfinance
         try:
             md = self._yf()
             validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1",
@@ -512,6 +566,7 @@ class MarketDataHandler:
         except Exception as e:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
 
+        # 4. CSV (last resort)
         md = self._csv()
         validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True,
                        max_stale_off_h=168.0)
@@ -522,7 +577,10 @@ class MarketDataHandler:
             ts, v = self._spot_cache
             if (datetime.now(timezone.utc) - ts).total_seconds() < self.cfg.spot_cache_min * 60:
                 return v
+        
         price = None
+        
+        # 1. Twelve Data
         if self.cfg.twelve_data_api_key:
             try:
                 r = self.session.get(
@@ -534,6 +592,19 @@ class MarketDataHandler:
                     price = p
             except Exception:
                 pass
+
+        # 2. Gold-API (Free, Keyless)
+        if price is None:
+            try:
+                r = self.session.get("https://api.gold-api.com/price/XAU", timeout=5)
+                r.raise_for_status()
+                p = float(r.json().get("price", 0) or 0)
+                if p > 0:
+                    price = p
+            except Exception:
+                pass
+
+        # 3. yfinance
         if price is None and yf is not None:
             try:
                 p = float(yf.Ticker("GC=F").fast_info["last_price"])
@@ -541,8 +612,11 @@ class MarketDataHandler:
                     price = p
             except Exception:
                 pass
+
+        # 4. Last H1 close
         if price is None:
             price = float(h1["close"].iloc[-1])
+            
         self._spot_cache = (datetime.now(timezone.utc), price)
         return price
 
@@ -557,11 +631,11 @@ class MarketDataHandler:
 
 
 # ============================================================================
-# 9. MACRO  (v9: tiered severity)
+# 8. MACRO
 # ============================================================================
 @dataclass
 class MacroCheck:
-    severity: str  # "OK", "WARN", "VETO", "HALT"
+    severity: str
     reason: str
     dxy_chg: float = 0.0
     tnx_chg: float = 0.0
@@ -606,6 +680,7 @@ def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
             elif abs(dxy_chg) >= cfg.dxy_warn:
                 severity = "WARN"
                 notes.append(f"DXY±{dxy_chg:.2f}%")
+                
         if len(tnx) >= 2:
             tnx_chg = float((tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100)
             if abs(tnx_chg) >= cfg.tnx_halt:
@@ -631,7 +706,7 @@ def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
 
 
 # ============================================================================
-# 10. SESSION PROFILE
+# 9. SESSION PROFILE
 # ============================================================================
 def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
     now = datetime.now(timezone.utc)
@@ -646,7 +721,7 @@ def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
 
 
 # ============================================================================
-# 11. SIGNAL GENERATOR
+# 10. SIGNAL GENERATOR
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -811,7 +886,7 @@ class SignalGenerator:
 
 
 # ============================================================================
-# 12. AUDIT DB
+# 11. AUDIT DB
 # ============================================================================
 def _to_utc_iso(dt_or_str: Any) -> str:
     if isinstance(dt_or_str, str):
@@ -948,7 +1023,6 @@ class AuditDB:
             return []
 
     def get_today_r_sum(self) -> float:
-        """v9: COALESCE(closed_at, ts) for robustness on legacy rows."""
         if not self.ok:
             return 0.0
         try:
@@ -965,7 +1039,6 @@ class AuditDB:
             return 0.0
 
     def last_action(self) -> Optional[Tuple[str, datetime, float, str]]:
-        """Returns (action, ts, spot, regime)."""
         if not self.ok:
             return None
         try:
@@ -983,7 +1056,6 @@ class AuditDB:
 
     def is_dup(self, cooldown: int, action: str, spot: float, regime: str,
                tol: float = 2.0) -> bool:
-        """v9: fingerprint includes regime."""
         last = self.last_action()
         if not last:
             return False
@@ -996,7 +1068,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 13. RISK MANAGEMENT ENGINE  (v9: TP2 feasibility cap)
+# 12. RISK MANAGEMENT ENGINE
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -1062,7 +1134,6 @@ class RiskManagementEngine:
             return None
         sl_d = max(atr_v * atr_mult, 1.0)
         risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
-        # XAUUSD: 1 lot = 100 oz; $1 move × 1 lot = $100 P/L
         raw_lot = risk_usd / (sl_d * 100.0)
         lot = round(raw_lot, 2)
         if lot < 0.01:
@@ -1074,7 +1145,6 @@ class RiskManagementEngine:
         tp1_r = blended.get("tp1_mult", 1.5) or 1.5
         tp2_r = blended.get("tp2_mult", 2.5) or 2.5
 
-        # v9: TP2 feasibility cap
         tp2_dist_raw = sl_d * tp2_r
         tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
         tp2_dist = min(tp2_dist_raw, tp2_dist_cap)
@@ -1106,7 +1176,7 @@ class RiskManagementEngine:
 
 
 # ============================================================================
-# 14. OUTCOME TRACKER
+# 13. OUTCOME TRACKER
 # ============================================================================
 class OutcomeTracker:
     def __init__(self, db: AuditDB):
@@ -1220,7 +1290,7 @@ class OutcomeTracker:
 
 
 # ============================================================================
-# 15. TELEGRAM NOTIFIER  (v9: retry + status footer)
+# 14. TELEGRAM NOTIFIER
 # ============================================================================
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
@@ -1320,7 +1390,7 @@ class TelegramNotifier:
 
 
 # ============================================================================
-# 16. ORCHESTRATOR
+# 15. ORCHESTRATOR
 # ============================================================================
 class TradingBotOrchestrator:
     def __init__(self, cfg: BotConfig):
@@ -1449,7 +1519,7 @@ class TradingBotOrchestrator:
 
 
 # ============================================================================
-# 17. MAIN
+# 16. MAIN
 # ============================================================================
 def main() -> int:
     return TradingBotOrchestrator(BotConfig.from_env()).run()
