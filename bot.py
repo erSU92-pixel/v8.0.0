@@ -1,13 +1,10 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.3.1 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.3.2 PRODUCTION
 ================================================================
-Changes v9.3.0 → v9.3.1:
-  [FIX]      Fixed TwelveData `.fillna()` crash on volume column.
-  [FIX]      YFinance validation now allows gaps (`allow_gap=True`).
-  [FIX]      Dukascopy fallback gracefully skips if `fetch` is missing.
-  [SAFETY]   Added DUMMY DATA GUARD: If source is "csv", auto-execution
-             is FORCE DISABLED to prevent executing trades at $2000
-             when real gold is at $3900+.
+Changes v9.3.1 → v9.3.2:
+  [FIX] MetaApi SDK method updated: use `get_accounts_with_infinite_scroll_pagination()`
+        instead of deprecated `get_accounts()` for newer SDK versions.
+  [FIX] Handle async generator returned by the new method properly.
 """
 from __future__ import annotations
 
@@ -59,7 +56,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.3.1"
+VERSION = "9.3.2"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -364,7 +361,6 @@ class MarketDataHandler:
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
             
-        # FIX BUG: .fillna() on float
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
         else:
@@ -376,7 +372,6 @@ class MarketDataHandler:
         if dukascopy_python is None: return None
         try:
             end = datetime.now(timezone.utc)
-            # Wrap fetch in try-except to handle API mismatch safely
             try:
                 df_h1 = dukascopy_python.fetch(instrument="XAU/USD", interval="1HOUR", offer_side="BID", start=end - timedelta(days=30), end=end)
                 df_m15 = dukascopy_python.fetch(instrument="XAU/USD", interval="15MIN", offer_side="BID", start=end - timedelta(days=5), end=end)
@@ -476,7 +471,6 @@ class MarketDataHandler:
 
         try:
             md = self._yf()
-            # FIX BUG: allow_gap=True for yfinance
             validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1", allow_gap=True)
             validate_ohlcv(md.m15, 50, "yf-M15", allow_gap=True)
             return md
@@ -976,7 +970,7 @@ class TelegramNotifier:
 
 
 # ============================================================================
-# 13. METAAPI EXECUTION ENGINE
+# 13. METAAPI EXECUTION ENGINE (FIXED v9.3.2)
 # ============================================================================
 class MetaApiExecutionEngine:
     def __init__(self, cfg: BotConfig):
@@ -987,11 +981,22 @@ class MetaApiExecutionEngine:
         if not self.enabled or not levels or levels.get("skip"): return "SKIPPED"
         try:
             api = MetaApi(self.cfg.metaapi_token)
-            accounts = await api.metatrader_account_api.get_accounts()
-            account = next((a for a in accounts if str(a.login) == str(self.cfg.mt5_login)), None)
+            
+            # === FIX: Use new method name for newer SDK versions ===
+            accounts = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+            account = None
+            async for acc in accounts:
+                if str(acc.login) == str(self.cfg.mt5_login):
+                    account = acc
+                    break
+            
             if not account:
                 log_event(logging.INFO, "metaapi_provisioning", login=self.cfg.mt5_login)
-                account = await api.metatrader_account_api.create_account({'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login, 'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server, 'platform': 'mt5', 'magic': 123456})
+                account = await api.metatrader_account_api.create_account({
+                    'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login,
+                    'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server,
+                    'platform': 'mt5', 'magic': 123456
+                })
             
             await account.wait_connected(timeout_in_seconds=60)
             connection = account.get_rpc_connection()
@@ -1057,12 +1062,10 @@ class TradingBotOrchestrator:
             print(f"ACTION: ERROR — {err}")
             return 1
 
-        # === SAFETY GUARD: DUMMY DATA PROTECTION ===
         if md.source == "csv":
             log_event(logging.ERROR, "dummy_data_active", msg="ALL API FEEDS FAILED. USING CSV. EXECUTION DISABLED FOR SAFETY.")
             self.executor.enabled = False
             self.cfg.execute_trades = False
-        # ============================================
 
         try:
             n_closed = self.outcomes.process(md.h1)
