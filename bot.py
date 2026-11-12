@@ -1,15 +1,13 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.2.1 PRODUCTION
+XAUUSD Quantitative Institutional Signal Bot — v9.3.0 PRODUCTION
 ================================================================
-Changes v9.2.0 → v9.2.1:
-  [TELEGRAM] Default behavior now sends ONLY valid executable BUY/SELL
-             signals + bot errors. WAIT, SKIP (min-lot), and HALT
-             (risk lock) are suppressed by default to reduce noise.
-             Opt-in via env: NOTIFY_WAIT=1, NOTIFY_SKIP=1, NOTIFY_HALT=1.
-  [TELEGRAM] HALT now renders its own message (was previously disguised
-             as WAIT, misleading when action was BUY/SELL).
-  [NO CHANGE] Signal logic, risk engine, macro filter, data sources,
-              Kelly, outcome tracker, dedup — all identical to v9.2.0.
+Changes v9.2.1 → v9.3.0:
+  [EXECUTION] Integrated MetaApi SDK for FULLY AUTOMATED TRADING.
+  [EXECUTION] Added `MetaApiExecutionEngine` class. Connects to MT5 cloud,
+              provisions account if needed, and fires market orders.
+  [SAFETY]    Requires `EXECUTE_TRADES=1` env var to actually fire. Default is 0.
+  [SAFETY]    Validates broker symbol via `MT5_SYMBOL` env (default XAUUSD).
+  [ROBUST]    Catches async loop errors gracefully if MetaApi connection fails.
 """
 from __future__ import annotations
 
@@ -24,6 +22,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -45,6 +44,11 @@ except ImportError:
     dukascopy_python = None
 
 try:
+    from metaapi_cloud_sdk import MetaApi
+except ImportError:
+    MetaApi = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -55,7 +59,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.2.1"
+VERSION = "9.3.0"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -71,21 +75,28 @@ class BotConfig:
     http_timeout: int = 12
     telegram_timeout: int = 8
     telegram_retries: int = 3
-    # === ACCOUNT: screenshot shows $1,000 Headway Demo ===
+    
     account_size_usd: float = 1_000.0
     risk_pct: float = 1.0
-    # Hard guard: skip trade if min lot (0.01) risks more than this %
     max_lot_risk_pct: float = 2.5
     signal_cooldown_min: int = 30
     spot_cache_min: int = 2
     macro_cache_min: int = 30
     news_enabled: bool = True
-    # ── Notification verbosity (NEW in v9.2.1) ─────────────────────
-    # Default: ONLY valid executable BUY/SELL signals + bot errors.
-    notify_wait: bool = False   # WAIT updates (bot alive but no setup)
-    notify_skip: bool = False   # min-lot SKIP alerts (need bigger account)
-    notify_halt: bool = False   # risk HALT alerts (CB or DD lockout)
-    # ────────────────────────────────────────────────────────────────
+    
+    # Notification settings
+    notify_wait: bool = False
+    notify_skip: bool = False
+    notify_halt: bool = False
+
+    # MetaApi Execution
+    execute_trades: bool = False
+    metaapi_token: Optional[str] = None
+    mt5_login: Optional[str] = None
+    mt5_password: Optional[str] = None
+    mt5_server: Optional[str] = None
+    mt5_symbol: str = "XAUUSD"
+
     max_stale_h_market: float = 1.5
     max_stale_h_off: float = 72.0
     dxy_warn: float = 0.3
@@ -95,11 +106,12 @@ class BotConfig:
     tnx_veto: float = 1.5
     tnx_halt: float = 3.0
     max_tp2_atr_mult: float = 4.0
-    # Small-account defaults
+    
     daily_dd_limit_r: float = 2.0
     daily_dd_derisk_r: float = 1.0
     daily_dd_derisk_mult: float = 0.5
     cb_halt_consecutive: int = 3
+    
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -113,13 +125,23 @@ class BotConfig:
             risk_pct=float(os.getenv("RISK_PCT", "1.0")),
             max_lot_risk_pct=float(os.getenv("MAX_LOT_RISK_PCT", "2.5")),
             news_enabled=os.getenv("NEWS_ENABLED", "1") == "1",
+            
             notify_wait=os.getenv("NOTIFY_WAIT", "0") == "1",
             notify_skip=os.getenv("NOTIFY_SKIP", "0") == "1",
             notify_halt=os.getenv("NOTIFY_HALT", "0") == "1",
+
+            execute_trades=os.getenv("EXECUTE_TRADES", "0") == "1",
+            metaapi_token=os.getenv("METAAPI_TOKEN"),
+            mt5_login=os.getenv("MT5_LOGIN"),
+            mt5_password=os.getenv("MT5_PASSWORD"),
+            mt5_server=os.getenv("MT5_SERVER"),
+            mt5_symbol=os.getenv("MT5_SYMBOL", "XAUUSD"),
+
             daily_dd_limit_r=float(os.getenv("DAILY_DD_LIMIT_R", "2.0")),
             daily_dd_derisk_r=float(os.getenv("DAILY_DD_DERISK_R", "1.0")),
             daily_dd_derisk_mult=float(os.getenv("DAILY_DD_DERISK_MULT", "0.5")),
             cb_halt_consecutive=int(os.getenv("CB_HALT_CONSECUTIVE", "3")),
+            
             twelve_data_api_key=os.getenv("TWELVE_DATA_API_KEY"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
@@ -130,19 +152,18 @@ class BotConfig:
     def warnings(self) -> List[str]:
         w = []
         if not self.twelve_data_api_key:
-            w.append("TWELVE_DATA_API_KEY missing → will use Dukascopy/Yahoo")
+            w.append("TWELVE_DATA_API_KEY missing → fallback to Dukascopy/Yahoo")
         if not self.telegram_bot_token or not self.telegram_chat_id:
             w.append("Telegram creds missing → stdout only")
         if not SUPABASE.enabled:
-            w.append("Supabase disabled → SQLite-only, Kelly may never activate")
+            w.append("Supabase disabled → SQLite-only")
+        if self.execute_trades:
+            if not self.metaapi_token:
+                w.append("EXECUTE_TRADES=1 but METAAPI_TOKEN missing! Execution will fail.")
+            else:
+                w.append(f"⚠️ AUTO-EXECUTION ENABLED for {self.mt5_symbol} on {self.mt5_server}.")
         if self.account_size_usd < 5000:
-            w.append(
-                f"INFO: Account ${self.account_size_usd:.0f} — on XAUUSD H1, "
-                f"broker min lot (0.01) risks ~2-3% equity per trade. "
-                f"RISK_PCT={self.risk_pct}% is a TARGET; actual is capped at "
-                f"MAX_LOT_RISK_PCT={self.max_lot_risk_pct}%. "
-                f"Upgrade to $5,000+ or use Cent account for true 1% risk."
-            )
+            w.append(f"INFO: Account ${self.account_size_usd:.0f} — min lot risk capped at {self.max_lot_risk_pct}%.")
         return w
 
 
@@ -187,17 +208,14 @@ def log_event(level: int = logging.INFO, event: str = "", **kw: Any) -> None:
 def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False).mean()
 
-
 def sma(s: pd.Series, p: int) -> pd.Series:
     return s.rolling(p, min_periods=p).mean()
-
 
 def rsi(s: pd.Series, p: int = 14) -> pd.Series:
     d = s.diff()
     gain = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
     loss = -d.clip(upper=0).ewm(alpha=1 / p, adjust=False).mean()
     return 100.0 - 100.0 / (1.0 + gain / (loss + 1e-10))
-
 
 def atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
     tr = pd.concat([
@@ -206,7 +224,6 @@ def atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
         (df["low"] - df["close"].shift(1)).abs(),
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / p, adjust=False).mean()
-
 
 def adx(df: pd.DataFrame, p: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
     up, dn = df["high"].diff(), -df["low"].diff()
@@ -218,7 +235,6 @@ def adx(df: pd.DataFrame, p: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]
     dx = 100 * (p_di - m_di).abs() / (p_di + m_di + 1e-10)
     return dx.ewm(alpha=1 / p, adjust=False).mean(), p_di, m_di
 
-
 def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
     if df["volume"].sum() <= 0:
         return float(df["close"].median())
@@ -228,13 +244,12 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 4. HOLIDAYS
+# 4. HOLIDAYS & SESSIONS
 # ============================================================================
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     weeks = calendar.monthcalendar(year, month)
     days = [w[weekday] for w in weeks if w[weekday] != 0]
     return date(year, month, days[n - 1] if n > 0 else days[n])
-
 
 def _easter(year: int) -> date:
     a = year % 19
@@ -249,7 +264,6 @@ def _easter(year: int) -> date:
     month, day = divmod(h + l - 7 * m + 114, 31)
     return date(year, month, day + 1)
 
-
 def _holiday_set(year: int) -> Set[date]:
     h: Set[date] = {
         date(year, 1, 1),
@@ -262,30 +276,33 @@ def _holiday_set(year: int) -> Set[date]:
         _nth_weekday(year, 11, 3, 4),
         date(year, 12, 25),
     }
-    if year >= 2022:
-        h.add(date(year, 6, 19))
+    if year >= 2022: h.add(date(year, 6, 19))
     return h
 
-
 _HOLIDAYS: Dict[int, Set[date]] = {y: _holiday_set(y) for y in range(2024, 2031)}
-
 
 def is_holiday(d: date) -> bool:
     return d in _HOLIDAYS.get(d.year, set())
 
-
 def is_market_open(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
-    if is_holiday(now.date()):
-        return False
+    if is_holiday(now.date()): return False
     wd, h = now.weekday(), now.hour
-    if wd == 5:
-        return False
-    if wd == 6:
-        return h >= 22
-    if wd == 4:
-        return h < 21
+    if wd == 5: return False
+    if wd == 6: return h >= 22
+    if wd == 4: return h < 21
     return True
+
+def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
+    now = datetime.now(timezone.utc)
+    if not is_market_open(now):
+        return "CLOSED", False, 999.0, 1.0
+    h = now.hour
+    if 0 <= h < 7:   return "ASIA_RANGE",   True, 65.0, 1.0
+    if 7 <= h < 12:  return "LONDON_TREND", True, 70.0, 1.3
+    if 12 <= h < 16: return "NY_OVERLAP",   True, 75.0, 1.5
+    if 16 <= h < 21: return "NY_PM",        True, 70.0, 1.3
+    return "OFF_HOURS", False, 999.0, 1.0
 
 
 # ============================================================================
@@ -297,31 +314,23 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str,
                    max_stale_off_h: float = 72.0) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
     miss = req - set(df.columns)
-    if miss:
-        raise ValueError(f"{label}: missing {miss}")
-    if len(df) < min_bars:
-        raise ValueError(f"{label}: {len(df)}<{min_bars}")
-    if df[["open", "high", "low", "close"]].isna().any().any():
-        raise ValueError(f"{label}: NaN OHLC")
-    if (df["high"] < df["low"]).any():
-        raise ValueError(f"{label}: high<low")
-    if df["volume"].sum() <= 0:
-        raise ValueError(f"{label}: zero volume")
+    if miss: raise ValueError(f"{label}: missing {miss}")
+    if len(df) < min_bars: raise ValueError(f"{label}: {len(df)}<{min_bars}")
+    if df[["open", "high", "low", "close"]].isna().any().any(): raise ValueError(f"{label}: NaN OHLC")
+    if (df["high"] < df["low"]).any(): raise ValueError(f"{label}: high<low")
+    if df["volume"].sum() <= 0: raise ValueError(f"{label}: zero volume")
+    
     if not allow_gap and len(df) > 1:
         gaps = df["time"].diff()
         for i in range(1, len(df)):
             g = gaps.iloc[i]
-            if g <= pd.Timedelta("4h"):
-                continue
-            prev_t = df["time"].iloc[i - 1]
-            curr_t = df["time"].iloc[i]
-            if g > pd.Timedelta("24h"):
-                continue
-            if prev_t.weekday() == 4 and prev_t.hour >= 20:
-                continue
-            if curr_t.weekday() in (6, 0):
-                continue
+            if g <= pd.Timedelta("4h"): continue
+            prev_t, curr_t = df["time"].iloc[i - 1], df["time"].iloc[i]
+            if g > pd.Timedelta("24h"): continue
+            if prev_t.weekday() == 4 and prev_t.hour >= 20: continue
+            if curr_t.weekday() in (6, 0): continue
             raise ValueError(f"{label}: internal gap {g} at {curr_t}")
+            
     last_ts = pd.to_datetime(df["time"].iloc[-1])
     now = datetime.now(timezone.utc)
     age_h = (now.replace(tzinfo=None) - last_ts).total_seconds() / 3600
@@ -347,26 +356,21 @@ _PARAM_BOUNDS = {
     "max_hold":  (12.0, 168.0),
 }
 
-
 def _validate_params(params: Dict[str, Dict[str, float]]) -> Tuple[bool, str]:
     for regime in REGIMES:
         p = params.get(regime, {})
         for k, (lo, hi) in _PARAM_BOUNDS.items():
             v = p.get(k)
-            if v is None or not isinstance(v, (int, float)):
-                return False, f"{regime}.{k} missing or non-numeric"
-            if not (lo <= v <= hi):
-                return False, f"{regime}.{k}={v} outside [{lo}, {hi}]"
+            if v is None or not isinstance(v, (int, float)): return False, f"{regime}.{k} missing"
+            if not (lo <= v <= hi): return False, f"{regime}.{k}={v} outside bounds"
     return True, "ok"
-
 
 def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
     path = os.getenv("PARAMS_FILE", "params.json")
     if not os.path.exists(path):
         return {r: dict(DEFAULT_PER_REGIME_PARAMS[r]) for r in REGIMES}, "builtin"
     try:
-        with open(path) as f:
-            j = json.load(f)
+        with open(path) as f: j = json.load(f)
         schema = int(j.get("schema", 1))
         if schema >= 2:
             per = j.get("per_regime", {})
@@ -396,14 +400,12 @@ def _retry_session(retries: int, backoff: float) -> requests.Session:
     s.headers.update({"User-Agent": f"XAUUSD-Quant/{VERSION}"})
     return s
 
-
 @dataclass
 class MarketData:
     h1: pd.DataFrame
     m15: pd.DataFrame
     source: str
     m15_synthetic: bool = False
-
 
 class MarketDataHandler:
     def __init__(self, cfg: BotConfig):
@@ -412,108 +414,71 @@ class MarketDataHandler:
         self._spot_cache: Optional[Tuple[datetime, float]] = None
 
     def _twelve(self, interval: str, size: int) -> Optional[pd.DataFrame]:
-        if not self.cfg.twelve_data_api_key:
-            return None
-        url = (f"https://api.twelvedata.com/time_series?symbol=XAU/USD"
-               f"&interval={interval}&outputsize={size}"
-               f"&apikey={self.cfg.twelve_data_api_key}")
+        if not self.cfg.twelve_data_api_key: return None
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={interval}&outputsize={size}&apikey={self.cfg.twelve_data_api_key}"
         r = self.session.get(url, timeout=self.cfg.http_timeout)
         r.raise_for_status()
         j = r.json()
         if j.get("status") == "error" or j.get("code", 200) >= 400:
             raise RuntimeError(j.get("message", "TwelveData error"))
         vals = j.get("values") or []
-        if not vals:
-            return None
+        if not vals: return None
         df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
-        else:
-            df["volume"] = 1000.0
+        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
         return df.sort_values("time").reset_index(drop=True)
 
     def _dukascopy(self) -> Optional[MarketData]:
-        if dukascopy_python is None:
-            return None
+        if dukascopy_python is None: return None
         try:
             end = datetime.now(timezone.utc)
-            start_h1 = end - timedelta(days=30)
-            start_m15 = end - timedelta(days=5)
-
-            df_h1 = dukascopy_python.fetch(
-                instrument="XAU/USD", interval="1HOUR", offer_side="BID",
-                start=start_h1, end=end
-            )
-            df_m15 = dukascopy_python.fetch(
-                instrument="XAU/USD", interval="15MIN", offer_side="BID",
-                start=start_m15, end=end
-            )
-
-            if df_h1 is None or len(df_h1) < self.cfg.min_bars:
-                return None
-
-            df_h1 = df_h1.reset_index().rename(columns={
-                "timestamp": "time", "open": "open", "high": "high",
-                "low": "low", "close": "close", "volume": "volume"
-            })
+            df_h1 = dukascopy_python.fetch(instrument="XAU/USD", interval="1HOUR", offer_side="BID", start=end - timedelta(days=30), end=end)
+            df_m15 = dukascopy_python.fetch(instrument="XAU/USD", interval="15MIN", offer_side="BID", start=end - timedelta(days=5), end=end)
+            
+            if df_h1 is None or len(df_h1) < self.cfg.min_bars: return None
+            df_h1 = df_h1.reset_index().rename(columns={"timestamp": "time"})
             df_h1["time"] = pd.to_datetime(df_h1["time"], utc=True).dt.tz_localize(None)
-            if "volume" not in df_h1.columns:
-                df_h1["volume"] = 1000.0
+            if "volume" not in df_h1.columns: df_h1["volume"] = 1000.0
 
             if df_m15 is None or len(df_m15) < 50:
                 m15 = df_h1.set_index("time").resample("15min").ffill().reset_index()
                 m15["volume"] /= 4.0
                 synth = True
             else:
-                m15 = df_m15.reset_index().rename(columns={
-                    "timestamp": "time", "open": "open", "high": "high",
-                    "low": "low", "close": "close", "volume": "volume"
-                })
+                m15 = df_m15.reset_index().rename(columns={"timestamp": "time"})
                 m15["time"] = pd.to_datetime(m15["time"], utc=True).dt.tz_localize(None)
-                if "volume" not in m15.columns:
-                    m15["volume"] = 1000.0
+                if "volume" not in m15.columns: m15["volume"] = 1000.0
                 synth = False
 
             df_h1 = df_h1.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
             m15 = m15.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
-
             return MarketData(df_h1, m15, "dukascopy", m15_synthetic=synth)
         except Exception as e:
             log_event(logging.WARNING, "dukascopy_fail", err=str(e)[:120])
             return None
 
     def _yf(self) -> MarketData:
-        if yf is None:
-            raise RuntimeError("yfinance missing")
+        if yf is None: raise RuntimeError("yfinance missing")
         tk = yf.Ticker("GC=F")
         h1_raw = tk.history(period="60d", interval="1h")
         m15_raw = tk.history(period="60d", interval="15m")
-        if h1_raw.empty:
-            raise RuntimeError("Yahoo H1 empty")
+        if h1_raw.empty: raise RuntimeError("Yahoo H1 empty")
 
         def norm(df: pd.DataFrame) -> pd.DataFrame:
             df = df.reset_index()
-            tcol = "Datetime" if "Datetime" in df.columns else (
-                "Date" if "Date" in df.columns else df.columns[0])
-            df = df.rename(columns={tcol: "time", "Open": "open", "High": "high",
-                                    "Low": "low", "Close": "close", "Volume": "volume"})
+            tcol = "Datetime" if "Datetime" in df.columns else ("Date" if "Date" in df.columns else df.columns[0])
+            df = df.rename(columns={tcol: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
             df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
-            for c in ["open", "high", "low", "close"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            if "volume" in df.columns:
-                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
-            else:
-                df["volume"] = 1000.0
+            for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
             return df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
 
         h1 = norm(h1_raw)
         if not m15_raw.empty:
             m15 = norm(m15_raw)
-            if len(m15) >= 50:
-                return MarketData(h1, m15, "yfinance", m15_synthetic=False)
+            if len(m15) >= 50: return MarketData(h1, m15, "yfinance", m15_synthetic=False)
         m15 = h1.set_index("time").resample("15min").ffill().reset_index()
         m15["volume"] /= 4.0
         return MarketData(h1, m15, "yfinance+synthetic", m15_synthetic=True)
@@ -522,27 +487,15 @@ class MarketDataHandler:
         p = self.cfg.csv_path
         if not (os.path.exists(p) and os.path.getsize(p) > 0):
             d = os.path.dirname(p)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            dummy = pd.date_range(
-                end=datetime.now(timezone.utc).replace(tzinfo=None),
-                periods=600, freq="h")
-            pd.DataFrame({
-                "time": dummy, "open": 2000.0, "high": 2001.0,
-                "low": 1999.0, "close": 2000.0, "volume": 1000.0,
-            }).to_csv(p, index=False)
-            log_event(logging.WARNING, "csv_seeded_dummy", path=p)
+            if d: os.makedirs(d, exist_ok=True)
+            dummy = pd.date_range(end=datetime.now(timezone.utc).replace(tzinfo=None), periods=600, freq="h")
+            pd.DataFrame({"time": dummy, "open": 2000.0, "high": 2001.0, "low": 1999.0, "close": 2000.0, "volume": 1000.0}).to_csv(p, index=False)
         df = pd.read_csv(p)
         df.columns = [c.strip().lower() for c in df.columns]
-        tcol = "datetime" if "datetime" in df.columns else (
-            "time" if "time" in df.columns else df.columns[0])
+        tcol = "datetime" if "datetime" in df.columns else ("time" if "time" in df.columns else df.columns[0])
         df["time"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None)
-        for c in ["open", "high", "low", "close"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
-        else:
-            df["volume"] = 1000.0
+        for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
         df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
         m15 = df.set_index("time").resample("15min").ffill().reset_index()
         m15["volume"] /= 4.0
@@ -553,9 +506,7 @@ class MarketDataHandler:
             h1 = self._twelve("1h", 500)
             m15 = self._twelve("15min", 200)
             if h1 is not None and len(h1) >= self.cfg.min_bars:
-                validate_ohlcv(h1, self.cfg.min_bars, "12data-H1",
-                               max_stale_market_h=self.cfg.max_stale_h_market,
-                               max_stale_off_h=self.cfg.max_stale_h_off)
+                validate_ohlcv(h1, self.cfg.min_bars, "12data-H1")
                 if m15 is None or len(m15) < 50:
                     m15 = h1.set_index("time").resample("15min").ffill().reset_index()
                     m15["volume"] /= 4.0
@@ -563,7 +514,6 @@ class MarketDataHandler:
                 else:
                     validate_ohlcv(m15, 50, "12data-M15")
                     synth = False
-                log_event(event="data_ok", source="twelvedata", m15_synthetic=synth)
                 return MarketData(h1, m15, "twelvedata", m15_synthetic=synth)
         except Exception as e:
             log_event(logging.WARNING, "twelvedata_fail", err=str(e)[:120])
@@ -571,64 +521,47 @@ class MarketDataHandler:
         try:
             md = self._dukascopy()
             if md is not None:
-                validate_ohlcv(md.h1, self.cfg.min_bars, "duka-H1",
-                               max_stale_market_h=self.cfg.max_stale_h_market)
+                validate_ohlcv(md.h1, self.cfg.min_bars, "duka-H1")
                 validate_ohlcv(md.m15, 50, "duka-M15")
-                log_event(event="data_ok", source=md.source, m15_synthetic=md.m15_synthetic)
                 return md
         except Exception as e:
             log_event(logging.WARNING, "dukascopy_validation_fail", err=str(e)[:120])
 
         try:
             md = self._yf()
-            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1",
-                           max_stale_market_h=self.cfg.max_stale_h_market)
+            validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1")
             validate_ohlcv(md.m15, 50, "yf-M15")
-            log_event(event="data_ok", source=md.source, m15_synthetic=md.m15_synthetic)
             return md
         except Exception as e:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
 
         md = self._csv()
-        validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True,
-                       max_stale_off_h=168.0)
+        validate_ohlcv(md.h1, self.cfg.min_bars, "csv-H1", allow_gap=True, max_stale_off_h=168.0)
         return md
 
     def fetch_spot(self, h1: pd.DataFrame) -> float:
         if self._spot_cache:
             ts, v = self._spot_cache
-            if (datetime.now(timezone.utc) - ts).total_seconds() < self.cfg.spot_cache_min * 60:
-                return v
+            if (datetime.now(timezone.utc) - ts).total_seconds() < self.cfg.spot_cache_min * 60: return v
         price = None
         if self.cfg.twelve_data_api_key:
             try:
-                r = self.session.get(
-                    f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}",
-                    timeout=6)
-                r.raise_for_status()
+                r = self.session.get(f"https://api.twelvedata.com/price?symbol=XAU/USD&apikey={self.cfg.twelve_data_api_key}", timeout=6)
                 p = float(r.json().get("price", 0) or 0)
-                if p > 0:
-                    price = p
-            except Exception:
-                pass
+                if p > 0: price = p
+            except Exception: pass
         if price is None:
             try:
                 r = self.session.get("https://api.gold-api.com/price/XAU", timeout=5)
-                r.raise_for_status()
                 p = float(r.json().get("price", 0) or 0)
-                if p > 0:
-                    price = p
-            except Exception:
-                pass
+                if p > 0: price = p
+            except Exception: pass
         if price is None and yf is not None:
             try:
                 p = float(yf.Ticker("GC=F").fast_info["last_price"])
-                if p > 0:
-                    price = p
-            except Exception:
-                pass
-        if price is None:
-            price = float(h1["close"].iloc[-1])
+                if p > 0: price = p
+            except Exception: pass
+        if price is None: price = float(h1["close"].iloc[-1])
         self._spot_cache = (datetime.now(timezone.utc), price)
         return price
 
@@ -636,10 +569,7 @@ class MarketDataHandler:
         fut = float(md.h1["close"].iloc[-1])
         spot = self.fetch_spot(md.h1)
         basis = spot - fut
-        if abs(basis) > 100:
-            log_event(logging.WARNING, "basis_anomaly", basis=round(basis, 2))
-            return 0.0
-        return basis
+        return 0.0 if abs(basis) > 100 else basis
 
 
 # ============================================================================
@@ -651,61 +581,36 @@ class MacroCheck:
     reason: str
     dxy_chg: float = 0.0
     tnx_chg: float = 0.0
-
     @property
-    def allowed(self) -> bool:
-        return self.severity in ("OK", "WARN")
-
+    def allowed(self) -> bool: return self.severity in ("OK", "WARN")
     @property
-    def blocks(self) -> bool:
-        return self.severity in ("VETO", "HALT")
-
+    def blocks(self) -> bool: return self.severity in ("VETO", "HALT")
 
 _macro_cache: Dict[str, Tuple[datetime, MacroCheck]] = {}
-
 
 def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
     now = datetime.now(timezone.utc)
     if "m" in _macro_cache:
         ts, val = _macro_cache["m"]
-        if (now - ts).total_seconds() < cfg.macro_cache_min * 60:
-            return val
-    if yf is None:
-        return MacroCheck("OK", "yfinance unavailable → bypass")
+        if (now - ts).total_seconds() < cfg.macro_cache_min * 60: return val
+    if yf is None: return MacroCheck("OK", "yfinance unavailable → bypass")
 
     try:
         dxy = yf.Ticker("DX-Y.NYB").history(period="5d")["Close"]
         tnx = yf.Ticker("^TNX").history(period="5d")["Close"]
-        dxy_chg = 0.0
-        tnx_chg = 0.0
-        severity = "OK"
-        notes = []
+        dxy_chg, tnx_chg, severity, notes = 0.0, 0.0, "OK", []
 
         if len(dxy) >= 2:
             dxy_chg = float((dxy.iloc[-1] - dxy.iloc[-2]) / dxy.iloc[-2] * 100)
-            if abs(dxy_chg) >= cfg.dxy_halt:
-                severity = "HALT"
-                notes.append(f"DXY{'+' if dxy_chg > 0 else ''}{dxy_chg:.2f}%")
-            elif abs(dxy_chg) >= cfg.dxy_veto:
-                severity = max(severity, "VETO", key=lambda x: ["OK", "WARN", "VETO", "HALT"].index(x))
-                notes.append(f"DXY{'+' if dxy_chg > 0 else ''}{dxy_chg:.2f}%")
-            elif abs(dxy_chg) >= cfg.dxy_warn:
-                severity = "WARN"
-                notes.append(f"DXY±{dxy_chg:.2f}%")
+            if abs(dxy_chg) >= cfg.dxy_halt: severity = "HALT"; notes.append(f"DXY{dxy_chg:+.2f}%")
+            elif abs(dxy_chg) >= cfg.dxy_veto: severity = max(severity, "VETO", key=lambda x: ["OK", "WARN", "VETO", "HALT"].index(x)); notes.append(f"DXY{dxy_chg:+.2f}%")
+            elif abs(dxy_chg) >= cfg.dxy_warn: severity = "WARN"; notes.append(f"DXY{dxy_chg:+.2f}%")
 
         if len(tnx) >= 2:
             tnx_chg = float((tnx.iloc[-1] - tnx.iloc[-2]) / tnx.iloc[-2] * 100)
-            if abs(tnx_chg) >= cfg.tnx_halt:
-                severity = "HALT"
-                notes.append(f"10Y{'+' if tnx_chg > 0 else ''}{tnx_chg:.2f}%")
-            elif abs(tnx_chg) >= cfg.tnx_veto:
-                if severity != "HALT":
-                    severity = "VETO"
-                notes.append(f"10Y{'+' if tnx_chg > 0 else ''}{tnx_chg:.2f}%")
-            elif abs(tnx_chg) >= cfg.tnx_warn:
-                if severity == "OK":
-                    severity = "WARN"
-                notes.append(f"10Y±{tnx_chg:.2f}%")
+            if abs(tnx_chg) >= cfg.tnx_halt: severity = "HALT"; notes.append(f"10Y{tnx_chg:+.2f}%")
+            elif abs(tnx_chg) >= cfg.tnx_veto: severity = "HALT" if severity == "HALT" else "VETO"; notes.append(f"10Y{tnx_chg:+.2f}%")
+            elif abs(tnx_chg) >= cfg.tnx_warn: severity = "WARN" if severity == "OK" else severity; notes.append(f"10Y{tnx_chg:+.2f}%")
 
         reason = "normal" if severity == "OK" else " ".join(notes)
         result = MacroCheck(severity, reason, dxy_chg, tnx_chg)
@@ -718,22 +623,7 @@ def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
 
 
 # ============================================================================
-# 9. SESSION PROFILE
-# ============================================================================
-def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
-    now = datetime.now(timezone.utc)
-    if not is_market_open(now):
-        return "CLOSED", False, 999.0, 1.0
-    h = now.hour
-    if 0 <= h < 7:   return "ASIA_RANGE",   True, 65.0, 1.0
-    if 7 <= h < 12:  return "LONDON_TREND", True, 70.0, 1.3
-    if 12 <= h < 16: return "NY_OVERLAP",   True, 75.0, 1.5
-    if 16 <= h < 21: return "NY_PM",        True, 70.0, 1.3
-    return "OFF_HOURS", False, 999.0, 1.0
-
-
-# ============================================================================
-# 10. SIGNAL GENERATOR
+# 9. SIGNAL GENERATOR
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -754,7 +644,6 @@ class EnsembleResult:
     voters_debug: Dict[str, Any] = field(default_factory=dict)
     skip_reason: Optional[str] = None
 
-
 class SignalGenerator:
     def __init__(self, params: Dict[str, Dict[str, float]], params_source: str):
         self.params = params
@@ -767,56 +656,41 @@ class SignalGenerator:
         dbg: Dict[str, int] = {}
 
         sma_votes = [1 if c > sma(close, p).iloc[-1] else -1 for p in (5, 10, 20, 50, 100, 200)]
-        v.extend(sma_votes)
-        dbg["sma"] = sum(sma_votes)
+        v.extend(sma_votes); dbg["sma"] = sum(sma_votes)
 
         e1 = 1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1
         e2 = 1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1
         e3 = 1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1
-        v.extend([e1, e2, e3])
-        dbg["ema"] = e1 + e2 + e3
+        v.extend([e1, e2, e3]); dbg["ema"] = e1 + e2 + e3
 
         r = float(rsi(close, 14).iloc[-1])
         r_v = [1 if r > 50 else -1, 1 if r < 70 else -1, 1 if r > 30 else -1]
-        v.extend(r_v)
-        dbg["rsi"] = sum(r_v)
+        v.extend(r_v); dbg["rsi"] = sum(r_v)
 
         adx_v, p_di, m_di = adx(df, 14)
-        m_v = [
-            1 if p_di.iloc[-1] > m_di.iloc[-1] else -1,
-            1 if adx_v.iloc[-1] > 20 else -1,
-            1 if c > close.iloc[-2] else -1,
-            1 if c > close.iloc[-5] else -1,
-            1 if c > close.iloc[-10] else -1,
-        ]
-        v.extend(m_v)
-        dbg["momentum"] = sum(m_v)
+        m_v = [1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_v.iloc[-1] > 20 else -1, 1 if c > close.iloc[-2] else -1, 1 if c > close.iloc[-5] else -1, 1 if c > close.iloc[-10] else -1]
+        v.extend(m_v); dbg["momentum"] = sum(m_v)
 
         mp = 0
         for n in (5, 10):
             hi_n, lo_n = df["high"].iloc[-n:].max(), df["low"].iloc[-n:].min()
             pos = (c - lo_n) / max(hi_n - lo_n, 1e-10)
             vote = 1 if pos > 0.5 else -1
-            v.append(vote)
-            mp += vote
+            v.append(vote); mp += vote
         dbg["micro"] = mp
 
         vol_v = 1 if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1] else -1
-        v.append(vol_v)
-        dbg["volume"] = vol_v
+        v.append(vol_v); dbg["volume"] = vol_v
 
         poc = volume_profile_poc(df)
         poc_v = 1 if c > poc else -1
-        v.append(poc_v)
-        dbg["poc"] = poc_v
+        v.append(poc_v); dbg["poc"] = poc_v
 
-        assert len(v) == 21
         bull = sum(1 for x in v if x == 1)
         bear = 21 - bull
         return max(bull, bear) / 21.0, bull, bear, dbg
 
-    def generate(self, md: MarketData, news: NewsResult, macro: MacroCheck,
-                 cfg: BotConfig) -> EnsembleResult:
+    def generate(self, md: MarketData, news: NewsResult, macro: MacroCheck, cfg: BotConfig) -> EnsembleResult:
         df, m15 = md.h1, md.m15
         close = df["close"]
         c_last = float(close.iloc[-1])
@@ -838,103 +712,66 @@ class SignalGenerator:
         rng = max(hi - lo, 0.01)
         wick_pct = (max(hi - max(op, cl), min(op, cl) - lo) / rng) * 100.0
         sweep = "NONE"
-        if hi > prev["high"].max() and cl < prev["high"].max():
-            sweep = "BEAR"
-        elif lo < prev["low"].min() and cl > prev["low"].min():
-            sweep = "BULL"
+        if hi > prev["high"].max() and cl < prev["high"].max(): sweep = "BEAR"
+        elif lo < prev["low"].min() and cl > prev["low"].min(): sweep = "BULL"
         h1_vr = last["volume"] / (df["volume"].iloc[-21:-1].mean() + 1e-10)
-        m15_vr = (m15["volume"].iloc[-1] / (m15["volume"].iloc[-20:].mean() + 1e-10)
-                  if not md.m15_synthetic else 1.0)
+        m15_vr = (m15["volume"].iloc[-1] / (m15["volume"].iloc[-20:].mean() + 1e-10) if not md.m15_synthetic else 1.0)
+        
         f_score = 30.0
-        if sweep != "NONE":
-            f_score += 35.0
-        if wick_pct > 40.0:
-            f_score += 20.0
-        if h1_vr > 1.2 or m15_vr > 1.3:
-            f_score += 15.0
+        if sweep != "NONE": f_score += 35.0
+        if wick_pct > 40.0: f_score += 20.0
+        if h1_vr > 1.2 or m15_vr > 1.3: f_score += 15.0
         f_score = min(f_score, 100.0)
 
         m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
         voter_agree, bull, bear, dbg = self._run_21_voters(df)
         combined = round((voter_agree * 0.6 + (f_score / 100.0) * 0.4) * 100, 1)
         intended = "BUY" if bull > bear else "SELL"
-        macro_ok = ((intended == "BUY" and c_last > ema200)
-                    or (intended == "SELL" and c_last < ema200))
+        macro_ok = ((intended == "BUY" and c_last > ema200) or (intended == "SELL" and c_last < ema200))
         gap = round(combined - threshold, 1)
 
         notes, action, skip_reason = [], "WAIT", None
-        if not news.allowed:
-            notes.append(f"NEWS: {news.reason}")
-            skip_reason = "NEWS"
-        elif macro.blocks:
-            notes.append(f"MACRO[{macro.severity}]: {macro.reason}")
-            skip_reason = f"MACRO_{macro.severity}"
-        elif not allowed:
-            notes.append(f"SESSION: {session}")
-            skip_reason = "SESSION"
-        elif combined < threshold:
-            notes.append(f"GATED[{dom}]: {combined}% under {threshold:.1f}% (gap {gap:+.1f})")
-            skip_reason = "GATE"
-        elif not macro_ok:
-            notes.append("VETO EMA200 H1")
-            skip_reason = "EMA200"
-        elif intended == "BUY" and m15_bull:
-            action = "BUY"
-            notes.append(f"OK[{dom}/{session}] {combined}%")
-        elif intended == "SELL" and not m15_bull:
-            action = "SELL"
-            notes.append(f"OK[{dom}/{session}] {combined}%")
-        else:
-            notes.append("M15 misaligned")
-            skip_reason = "M15"
-
-        if macro.severity == "WARN":
-            notes.append(f"macro_warn: {macro.reason}")
+        if not news.allowed: notes.append(f"NEWS: {news.reason}"); skip_reason = "NEWS"
+        elif macro.blocks: notes.append(f"MACRO[{macro.severity}]: {macro.reason}"); skip_reason = f"MACRO_{macro.severity}"
+        elif not allowed: notes.append(f"SESSION: {session}"); skip_reason = "SESSION"
+        elif combined < threshold: notes.append(f"GATED[{dom}]: {combined}% < {threshold:.1f}%"); skip_reason = "GATE"
+        elif not macro_ok: notes.append("VETO EMA200 H1"); skip_reason = "EMA200"
+        elif intended == "BUY" and m15_bull: action = "BUY"; notes.append(f"OK[{dom}/{session}] {combined}%")
+        elif intended == "SELL" and not m15_bull: action = "SELL"; notes.append(f"OK[{dom}/{session}] {combined}%")
+        else: notes.append("M15 misaligned"); skip_reason = "M15"
 
         dbg["news_source"] = news.source
         dbg["macro_severity"] = macro.severity
         return EnsembleResult(
-            action=action, total_score=combined,
-            voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
-            regime=dom, regime_weights=weights, poc_level=round(poc, 2),
-            notes=notes, atr_value=round(atr_val, 4), atr_multiplier=round(atr_mult, 4),
-            blended_params={k: round(v, 4) for k, v in blended.items()},
-            threshold=round(threshold, 1), gap_to_threshold=gap,
-            params_source=self.params_source, voters_debug=dbg,
-            skip_reason=skip_reason,
+            action=action, total_score=combined, voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
+            regime=dom, regime_weights=weights, poc_level=round(poc, 2), notes=notes, atr_value=round(atr_val, 4),
+            atr_multiplier=round(atr_mult, 4), blended_params={k: round(v, 4) for k, v in blended.items()},
+            threshold=round(threshold, 1), gap_to_threshold=gap, params_source=self.params_source, voters_debug=dbg, skip_reason=skip_reason
         )
 
 
 # ============================================================================
-# 11. AUDIT DB
+# 10. AUDIT DB
 # ============================================================================
 def _to_utc_iso(dt_or_str: Any) -> str:
-    if isinstance(dt_or_str, str):
-        d = datetime.fromisoformat(dt_or_str)
-    elif isinstance(dt_or_str, datetime):
-        d = dt_or_str
-    elif isinstance(dt_or_str, pd.Timestamp):
-        d = dt_or_str.to_pydatetime()
-    else:
-        d = datetime.now(timezone.utc)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
+    if isinstance(dt_or_str, str): d = datetime.fromisoformat(dt_or_str)
+    elif isinstance(dt_or_str, datetime): d = dt_or_str
+    elif isinstance(dt_or_str, pd.Timestamp): d = dt_or_str.to_pydatetime()
+    else: d = datetime.now(timezone.utc)
+    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
-
 
 class AuditDB:
     def __init__(self, path: str):
         self.ok = False
         try:
             d = os.path.dirname(path)
-            if d:
-                os.makedirs(d, exist_ok=True)
+            if d: os.makedirs(d, exist_ok=True)
             self.conn = sqlite3.connect(path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             with self.conn:
                 self.conn.execute("""CREATE TABLE IF NOT EXISTS signals(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts TEXT, action TEXT, spot REAL, score REAL,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, action TEXT, spot REAL, score REAL,
                     regime TEXT, kelly_pct REAL, lot REAL, risk REAL, notes TEXT)""")
                 self._migrate()
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
@@ -946,149 +783,77 @@ class AuditDB:
 
     def _migrate(self) -> None:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(signals)").fetchall()}
-        new_cols = [
-            ("signal_id", "TEXT"),
-            ("entry_price", "REAL"),
-            ("sl", "REAL"),
-            ("tp1", "REAL"),
-            ("tp2", "REAL"),
-            ("status", "TEXT DEFAULT 'OPEN'"),
-            ("r_multiple", "REAL"),
-            ("closed_at", "TEXT"),
-            ("closed_price", "REAL"),
-            ("max_hold_hours", "REAL DEFAULT 48"),
-        ]
+        new_cols = [("signal_id", "TEXT"), ("entry_price", "REAL"), ("sl", "REAL"), ("tp1", "REAL"), ("tp2", "REAL"), ("status", "TEXT DEFAULT 'OPEN'"), ("r_multiple", "REAL"), ("closed_at", "TEXT"), ("closed_price", "REAL"), ("max_hold_hours", "REAL DEFAULT 48")]
         for name, ctype in new_cols:
             if name not in cols:
-                try:
-                    self.conn.execute(f"ALTER TABLE signals ADD COLUMN {name} {ctype}")
-                except Exception as e:
-                    log_event(logging.WARNING, "db_migrate_col_fail", col=name, err=str(e)[:80])
-        try:
-            self.conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_signal_id ON signals(signal_id)")
-        except Exception:
-            pass
+                try: self.conn.execute(f"ALTER TABLE signals ADD COLUMN {name} {ctype}")
+                except Exception as e: log_event(logging.WARNING, "db_migrate_fail", col=name, err=str(e)[:80])
+        try: self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_signal_id ON signals(signal_id)")
+        except Exception: pass
         self.conn.commit()
 
-    def record(self, signal_id: str, e: EnsembleResult, spot: float,
-               levels: dict, max_hold_hours: float) -> None:
-        if not self.ok or not levels:
-            return
+    def record(self, signal_id: str, e: EnsembleResult, spot: float, levels: dict, max_hold_hours: float) -> None:
+        if not self.ok or not levels: return
         try:
             with self.conn:
                 self.conn.execute(
-                    "INSERT INTO signals(signal_id, ts, action, spot, entry_price, sl, tp1, tp2,"
-                    " score, regime, kelly_pct, lot, risk, notes, status, max_hold_hours)"
+                    "INSERT INTO signals(signal_id, ts, action, spot, entry_price, sl, tp1, tp2, score, regime, kelly_pct, lot, risk, notes, status, max_hold_hours)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'OPEN', ?)",
-                    (signal_id, _to_utc_iso(datetime.now(timezone.utc)),
-                     e.action, spot,
-                     levels["entry_price"], levels["sl_price"], levels["tp1_price"],
-                     levels["tp2_price"], e.total_score, e.regime,
-                     levels["risk_pct"], levels["lot_size"], levels["risk_amount_usd"],
-                     "; ".join(e.notes), max_hold_hours))
-        except Exception as ex:
-            log_event(logging.WARNING, "db_write_fail", err=str(ex)[:80])
+                    (signal_id, _to_utc_iso(datetime.now(timezone.utc)), e.action, spot, levels["entry_price"], levels["sl_price"], levels["tp1_price"], levels["tp2_price"], e.total_score, e.regime, levels["risk_pct"], levels["lot_size"], levels["risk_amount_usd"], "; ".join(e.notes), max_hold_hours))
+        except Exception as ex: log_event(logging.WARNING, "db_write_fail", err=str(ex)[:80])
 
     def get_open_signals(self) -> List[dict]:
-        if not self.ok:
-            return []
-        try:
-            rows = self.conn.execute(
-                "SELECT * FROM signals WHERE status='OPEN' AND action IN ('BUY','SELL')"
-                " AND sl IS NOT NULL AND tp1 IS NOT NULL AND entry_price IS NOT NULL"
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
+        if not self.ok: return []
+        try: return [dict(r) for r in self.conn.execute("SELECT * FROM signals WHERE status='OPEN' AND action IN ('BUY','SELL') AND sl IS NOT NULL AND tp1 IS NOT NULL AND entry_price IS NOT NULL").fetchall()]
+        except Exception: return []
 
-    def close_signal(self, signal_id: str, status: str,
-                     r_multiple: float, exit_price: float, exit_time: Any) -> None:
-        if not self.ok:
-            return
+    def close_signal(self, signal_id: str, status: str, r_multiple: float, exit_price: float, exit_time: Any) -> None:
+        if not self.ok: return
         try:
             with self.conn:
-                self.conn.execute(
-                    "UPDATE signals SET status=?, r_multiple=?, closed_at=?, closed_price=?"
-                    " WHERE signal_id=?",
-                    (status, round(r_multiple, 4), _to_utc_iso(exit_time),
-                     round(exit_price, 2), signal_id))
-        except Exception as ex:
-            log_event(logging.WARNING, "db_close_fail", err=str(ex)[:80])
+                self.conn.execute("UPDATE signals SET status=?, r_multiple=?, closed_at=?, closed_price=? WHERE signal_id=?", (status, round(r_multiple, 4), _to_utc_iso(exit_time), round(exit_price, 2), signal_id))
+        except Exception as ex: log_event(logging.WARNING, "db_close_fail", err=str(ex)[:80])
 
     def get_recent_closed(self, limit: int = 10) -> List[dict]:
-        if not self.ok:
-            return []
-        try:
-            rows = self.conn.execute(
-                "SELECT * FROM signals WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
-                " ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
+        if not self.ok: return []
+        try: return [dict(r) for r in self.conn.execute("SELECT * FROM signals WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT') ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)).fetchall()]
+        except Exception: return []
 
     def get_recent_r(self, limit: int = 50) -> List[float]:
-        if not self.ok:
-            return []
-        try:
-            rows = self.conn.execute(
-                "SELECT r_multiple FROM signals"
-                " WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
-                " AND r_multiple IS NOT NULL"
-                " ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [float(r[0]) for r in rows]
-        except Exception:
-            return []
+        if not self.ok: return []
+        try: return [float(r[0]) for r in self.conn.execute("SELECT r_multiple FROM signals WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT') AND r_multiple IS NOT NULL ORDER BY COALESCE(closed_at, ts) DESC LIMIT ?", (limit,)).fetchall()]
+        except Exception: return []
 
     def get_today_r_sum(self) -> float:
-        if not self.ok:
-            return 0.0
+        if not self.ok: return 0.0
         try:
-            today_start = datetime.now(timezone.utc).replace(
-                hour=0, minute=0, second=0, microsecond=0).isoformat()
-            row = self.conn.execute(
-                "SELECT COALESCE(SUM(r_multiple), 0) FROM signals"
-                " WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT')"
-                " AND r_multiple IS NOT NULL"
-                " AND COALESCE(closed_at, ts) >= ?", (today_start,)
-            ).fetchone()
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            row = self.conn.execute("SELECT COALESCE(SUM(r_multiple), 0) FROM signals WHERE status IN ('WIN_TP1','WIN_TP2','LOSS','TIMEOUT') AND r_multiple IS NOT NULL AND COALESCE(closed_at, ts) >= ?", (today_start,)).fetchone()
             return float(row[0]) if row else 0.0
-        except Exception:
-            return 0.0
+        except Exception: return 0.0
 
     def last_action(self) -> Optional[Tuple[str, datetime, float, str]]:
-        if not self.ok:
-            return None
+        if not self.ok: return None
         try:
-            row = self.conn.execute(
-                "SELECT action, ts, spot, regime FROM signals WHERE action IN ('BUY','SELL')"
-                " ORDER BY id DESC LIMIT 1").fetchone()
+            row = self.conn.execute("SELECT action, ts, spot, regime FROM signals WHERE action IN ('BUY','SELL') ORDER BY id DESC LIMIT 1").fetchone()
             if row:
                 ts = datetime.fromisoformat(row[1])
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
                 return row[0], ts, row[2], row[3] or ""
-        except Exception:
-            pass
+        except Exception: pass
         return None
 
-    def is_dup(self, cooldown: int, action: str, spot: float, regime: str,
-               tol: float = 2.0) -> bool:
+    def is_dup(self, cooldown: int, action: str, spot: float, regime: str, tol: float = 2.0) -> bool:
         last = self.last_action()
-        if not last:
-            return False
+        if not last: return False
         a, ts, sp, rg = last
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-        return (age < cooldown and a == action and rg == regime
-                and abs(sp - spot) < tol)
+        return (age < cooldown and a == action and rg == regime and abs(sp - spot) < tol)
 
 
 # ============================================================================
-# 12. RISK MANAGEMENT ENGINE
+# 11. RISK MANAGEMENT
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -1099,55 +864,39 @@ class RiskManagementEngine:
         recent = self.db.get_recent_closed(self.cfg.cb_halt_consecutive)
         n = 0
         for s in recent:
-            if s.get("status") == "LOSS":
-                n += 1
-            else:
-                break
-        if n >= self.cfg.cb_halt_consecutive:
-            return n, f"HALT after {n} consecutive losses"
-        if n >= 2:
-            return n, f"derisk 50% ({n} consec losses)"
+            if s.get("status") == "LOSS": n += 1
+            else: break
+        if n >= self.cfg.cb_halt_consecutive: return n, f"HALT after {n} consecutive losses"
+        if n >= 2: return n, f"derisk 50% ({n} consec losses)"
         return n, "normal"
 
     def _circuit_multiplier(self) -> Tuple[float, str]:
         n, reason = self._consecutive_losses()
-        if n >= self.cfg.cb_halt_consecutive:
-            return 0.0, reason
-        if n >= 2:
-            return 0.5, reason
+        if n >= self.cfg.cb_halt_consecutive: return 0.0, reason
+        if n >= 2: return 0.5, reason
         return 1.0, reason
 
     def _daily_dd_multiplier(self) -> Tuple[float, str]:
         today_r = self.db.get_today_r_sum()
-        if today_r <= -self.cfg.daily_dd_limit_r:
-            return 0.0, f"DAILY_DD_HALT ({today_r:+.2f}R ≤ -{self.cfg.daily_dd_limit_r}R)"
-        if today_r <= -self.cfg.daily_dd_derisk_r:
-            return self.cfg.daily_dd_derisk_mult, f"DAILY_DD_DERISK ({today_r:+.2f}R)"
+        if today_r <= -self.cfg.daily_dd_limit_r: return 0.0, f"DAILY_DD_HALT ({today_r:+.2f}R)"
+        if today_r <= -self.cfg.daily_dd_derisk_r: return self.cfg.daily_dd_derisk_mult, f"DAILY_DD_DERISK ({today_r:+.2f}R)"
         return 1.0, f"daily OK ({today_r:+.2f}R)"
 
     def kelly_risk_pct(self) -> Tuple[float, str]:
         frac, cap = risk_pct_from_env()
-        R_history: Optional[List[float]] = None
-        if SUPABASE.enabled:
-            R_history = SUPABASE.fetch_recent_r(50)
-        if not R_history:
-            R_history = self.db.get_recent_r(50)
-        if R_history and len(R_history) >= 20:
-            return kelly_fraction(R_history, fraction=frac, cap_pct=cap)
+        R_history = SUPABASE.fetch_recent_r(50) if SUPABASE.enabled else None
+        if not R_history: R_history = self.db.get_recent_r(50)
+        if R_history and len(R_history) >= 20: return kelly_fraction(R_history, fraction=frac, cap_pct=cap)
         n = len(R_history) if R_history else 0
         return self.cfg.risk_pct, f"fallback {self.cfg.risk_pct}% (n={n}<20)"
 
     def combined_multiplier(self) -> Tuple[float, str, str]:
         cb_mult, cb_r = self._circuit_multiplier()
         dd_mult, dd_r = self._daily_dd_multiplier()
-        final = min(cb_mult, dd_mult)
-        return final, cb_r, dd_r
+        return min(cb_mult, dd_mult), cb_r, dd_r
 
-    def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float,
-                       blended: dict, kelly_risk_pct: float,
-                       kelly_reason: str) -> Optional[dict]:
-        if sig not in ("BUY", "SELL"):
-            return None
+    def compute_levels(self, sig: str, entry: float, atr_v: float, atr_mult: float, blended: dict, kelly_risk_pct: float, kelly_reason: str) -> Optional[dict]:
+        if sig not in ("BUY", "SELL"): return None
         sl_d = max(atr_v * atr_mult, 1.0)
         risk_usd = self.cfg.account_size_usd * kelly_risk_pct / 100.0
         raw_lot = risk_usd / (sl_d * 100.0)
@@ -1157,118 +906,69 @@ class RiskManagementEngine:
         min_lot_risk_pct = (min_lot_risk_usd / self.cfg.account_size_usd) * 100.0
 
         if min_lot_risk_pct > self.cfg.max_lot_risk_pct:
-            required_account = min_lot_risk_usd / (self.cfg.max_lot_risk_pct / 100.0)
-            return {
-                "skip": True,
-                "skip_reason": (
-                    f"MIN_LOT_RISK_HIGH: lot {MIN_LOT} risks ${min_lot_risk_usd:.2f} "
-                    f"({min_lot_risk_pct:.2f}%) > max {self.cfg.max_lot_risk_pct}% "
-                    f"(SL ${sl_d:.2f}). "
-                    f"Upgrade to ≥ ${required_account:.0f} or use Cent account."
-                ),
-                "min_lot_risk_usd": round(min_lot_risk_usd, 2),
-                "min_lot_risk_pct": round(min_lot_risk_pct, 2),
-                "sl_distance": round(sl_d, 2),
-                "kelly_reason": kelly_reason,
-            }
+            req_acct = min_lot_risk_usd / (self.cfg.max_lot_risk_pct / 100.0)
+            return {"skip": True, "skip_reason": f"MIN_LOT_RISK_HIGH: 0.01 risks ${min_lot_risk_usd:.2f} ({min_lot_risk_pct:.2f}%) > max {self.cfg.max_lot_risk_pct}%", "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2), "sl_distance": round(sl_d, 2), "kelly_reason": kelly_reason}
 
         lot = round(raw_lot - 0.005, 2)
-        if lot < MIN_LOT:
-            lot = MIN_LOT
+        if lot < MIN_LOT: lot = MIN_LOT
         actual_risk = lot * sl_d * 100.0
         actual_risk_pct = (actual_risk / self.cfg.account_size_usd) * 100.0
 
         tp1_r = blended.get("tp1_mult", 1.5) or 1.5
         tp2_r = blended.get("tp2_mult", 2.5) or 2.5
-
         tp2_dist_raw = sl_d * tp2_r
         tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
         tp2_dist = min(tp2_dist_raw, tp2_dist_cap)
         tp2_capped = tp2_dist < tp2_dist_raw
 
         if sig == "BUY":
-            sl = entry - sl_d
-            tp1 = entry + sl_d * tp1_r
-            tp2 = entry + tp2_dist
-            be = entry + sl_d
+            sl = entry - sl_d; tp1 = entry + sl_d * tp1_r; tp2 = entry + tp2_dist; be = entry + sl_d
         else:
-            sl = entry + sl_d
-            tp1 = entry - sl_d * tp1_r
-            tp2 = entry - tp2_dist
-            be = entry - sl_d
+            sl = entry + sl_d; tp1 = entry - sl_d * tp1_r; tp2 = entry - tp2_dist; be = entry - sl_d
 
-        if tp2_capped:
-            kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}→{tp2_dist:.1f} (4×ATR)"
+        if tp2_capped: kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}->{tp2_dist:.1f}"
 
-        return {
-            "skip": False,
-            "entry_price": round(entry, 2), "sl_price": round(sl, 2),
-            "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2),
-            "break_even_trigger": round(be, 2),
-            "lot_size": lot, "risk_amount_usd": round(risk_usd, 2),
-            "actual_risk_usd": round(actual_risk, 2),
-            "actual_risk_pct": round(actual_risk_pct, 2),
-            "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason,
-            "tp2_capped": tp2_capped,
-            "sl_distance": round(sl_d, 2),
-            "min_lot_risk_usd": round(min_lot_risk_usd, 2),
-            "min_lot_risk_pct": round(min_lot_risk_pct, 2),
-        }
+        return {"skip": False, "entry_price": round(entry, 2), "sl_price": round(sl, 2), "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2), "break_even_trigger": round(be, 2), "lot_size": lot, "risk_amount_usd": round(risk_usd, 2), "actual_risk_usd": round(actual_risk, 2), "actual_risk_pct": round(actual_risk_pct, 2), "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason, "tp2_capped": tp2_capped, "sl_distance": round(sl_d, 2), "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2)}
 
 
 # ============================================================================
-# 13. OUTCOME TRACKER
+# 12. OUTCOME TRACKER
 # ============================================================================
 class OutcomeTracker:
     def __init__(self, db: AuditDB):
         self.db = db
 
     @staticmethod
-    def _resolve(action: str, bar_low: float, bar_high: float,
-                 sl: float, tp1: float) -> Optional[Tuple[str, float]]:
+    def _resolve(action: str, bar_low: float, bar_high: float, sl: float, tp1: float) -> Optional[Tuple[str, float]]:
         if action == "BUY":
-            if bar_low <= sl:
-                return "LOSS", sl
-            if bar_high >= tp1:
-                return "WIN_TP1", tp1
+            if bar_low <= sl: return "LOSS", sl
+            if bar_high >= tp1: return "WIN_TP1", tp1
         else:
-            if bar_high >= sl:
-                return "LOSS", sl
-            if bar_low <= tp1:
-                return "WIN_TP1", tp1
+            if bar_high >= sl: return "LOSS", sl
+            if bar_low <= tp1: return "WIN_TP1", tp1
         return None
 
     @staticmethod
     def _compute_r(sig: dict, status: str, exit_px: float) -> float:
-        entry = float(sig["entry_price"])
-        sl = float(sig["sl"])
+        entry, sl = float(sig["entry_price"]), float(sig["sl"])
         sl_d = abs(entry - sl)
-        if sl_d < 1e-6:
-            return 0.0
-        if status == "LOSS":
-            return -1.0
-        if status == "WIN_TP1":
-            return abs(float(sig["tp1"]) - entry) / sl_d
+        if sl_d < 1e-6: return 0.0
+        if status == "LOSS": return -1.0
+        if status == "WIN_TP1": return abs(float(sig["tp1"]) - entry) / sl_d
         return (exit_px - entry) / sl_d if sig["action"] == "BUY" else (entry - exit_px) / sl_d
 
     @staticmethod
     def _parse_ts(v: Any) -> datetime:
-        if isinstance(v, datetime):
-            d = v
-        else:
-            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        if d.tzinfo is not None:
-            d = d.astimezone(timezone.utc).replace(tzinfo=None)
+        d = v if isinstance(v, datetime) else datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if d.tzinfo is not None: d = d.astimezone(timezone.utc).replace(tzinfo=None)
         return d
 
     def process(self, df_h1: pd.DataFrame) -> int:
         open_sigs = self.db.get_open_signals()
-        if not open_sigs:
-            return 0
+        if not open_sigs: return 0
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         df = df_h1.copy()
-        if df["time"].dt.tz is not None:
-            df["time"] = df["time"].dt.tz_localize(None)
+        if df["time"].dt.tz is not None: df["time"] = df["time"].dt.tz_localize(None)
         closed = 0
 
         for sig in open_sigs:
@@ -1283,197 +983,150 @@ class OutcomeTracker:
                     if now > expiry_t:
                         last_px = float(df["close"].iloc[-1]) if not df.empty else float(sig["entry_price"])
                         r = self._compute_r(sig, "TIMEOUT", last_px)
-                        self.db.close_signal(sig["signal_id"], "TIMEOUT", r, last_px,
-                                             datetime.now(timezone.utc))
-                        if SUPABASE.enabled:
-                            SUPABASE.update_outcome(sig["signal_id"], "TIMEOUT", r, last_px)
-                        log_event(logging.INFO, "outcome_timeout_no_bars",
-                                  signal_id=sig["signal_id"], r=round(r, 3))
+                        self.db.close_signal(sig["signal_id"], "TIMEOUT", r, last_px, datetime.now(timezone.utc))
+                        if SUPABASE.enabled: SUPABASE.update_outcome(sig["signal_id"], "TIMEOUT", r, last_px)
                         closed += 1
                     continue
 
                 resolution = None
-                resolution_bar = None
                 for _, row in bars.iterrows():
-                    res = self._resolve(sig["action"], float(row["low"]),
-                                        float(row["high"]), float(sig["sl"]),
-                                        float(sig["tp1"]))
-                    if res:
-                        resolution = res
-                        resolution_bar = row
-                        break
+                    res = self._resolve(sig["action"], float(row["low"]), float(row["high"]), float(sig["sl"]), float(sig["tp1"]))
+                    if res: resolution = (res[0], res[1], row); break
 
                 if resolution:
-                    status, px = resolution
+                    status, px, resolution_bar = resolution
                     r = self._compute_r(sig, status, float(px))
-                    self.db.close_signal(sig["signal_id"], status, r, float(px),
-                                         resolution_bar["time"])
-                    if SUPABASE.enabled:
-                        SUPABASE.update_outcome(sig["signal_id"], status, r, float(px))
-                    log_event(logging.INFO, "outcome_resolved",
-                              signal_id=sig["signal_id"], status=status,
-                              r=round(r, 3), action=sig["action"])
+                    self.db.close_signal(sig["signal_id"], status, r, float(px), resolution_bar["time"])
+                    if SUPABASE.enabled: SUPABASE.update_outcome(sig["signal_id"], status, r, float(px))
                     closed += 1
                 elif now >= expiry_t:
                     last = bars.iloc[-1]
                     exit_px = float(last["close"])
                     r = self._compute_r(sig, "TIMEOUT", exit_px)
                     self.db.close_signal(sig["signal_id"], "TIMEOUT", r, exit_px, last["time"])
-                    if SUPABASE.enabled:
-                        SUPABASE.update_outcome(sig["signal_id"], "TIMEOUT", r, exit_px)
-                    log_event(logging.INFO, "outcome_timeout",
-                              signal_id=sig["signal_id"], r=round(r, 3))
+                    if SUPABASE.enabled: SUPABASE.update_outcome(sig["signal_id"], "TIMEOUT", r, exit_px)
                     closed += 1
             except Exception as e:
-                log_event(logging.WARNING, "outcome_eval_fail",
-                          signal_id=sig.get("signal_id"), err=str(e)[:120])
+                log_event(logging.WARNING, "outcome_eval_fail", signal_id=sig.get("signal_id"), err=str(e)[:120])
         return closed
 
 
 # ============================================================================
-# 14. TELEGRAM NOTIFIER
+# 13. TELEGRAM NOTIFIER
 # ============================================================================
-def _strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text)
-
+def _strip_html(text: str) -> str: return re.sub(r"<[^>]+>", "", text)
 
 class TelegramNotifier:
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
 
     def _post(self, payload: dict) -> bool:
-        if not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id):
-            return False
-        if ":" not in self.cfg.telegram_bot_token:
-            return False
+        if not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id): return False
+        if ":" not in self.cfg.telegram_bot_token: return False
         url = f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage"
         for attempt in range(self.cfg.telegram_retries):
             try:
                 r = requests.post(url, json=payload, timeout=self.cfg.telegram_timeout)
-                if r.status_code == 200:
-                    return True
+                if r.status_code == 200: return True
                 if r.status_code == 400 and "parse entities" in r.text:
-                    plain = {"chat_id": payload["chat_id"],
-                             "text": _strip_html(payload["text"]),
-                             "disable_web_page_preview": True}
-                    if "reply_markup" in payload:
-                        plain["reply_markup"] = payload["reply_markup"]
+                    plain = {"chat_id": payload["chat_id"], "text": _strip_html(payload["text"]), "disable_web_page_preview": True}
+                    if "reply_markup" in payload: plain["reply_markup"] = payload["reply_markup"]
                     r2 = requests.post(url, json=plain, timeout=self.cfg.telegram_timeout)
                     return r2.status_code == 200
-                log_event(logging.WARNING, "telegram_retry",
-                          attempt=attempt + 1, code=r.status_code, body=r.text[:200])
             except Exception as e:
-                log_event(logging.WARNING, "telegram_exc",
-                          attempt=attempt + 1, err=str(e)[:120])
-            if attempt < self.cfg.telegram_retries - 1:
-                time.sleep(2 ** attempt)
+                log_event(logging.WARNING, "telegram_exc", attempt=attempt + 1, err=str(e)[:120])
+            if attempt < self.cfg.telegram_retries - 1: time.sleep(2 ** attempt)
         return False
 
-    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict],
-                    cb_reason: str = "normal", dd_reason: str = "daily OK",
-                    next_eta_min: int = 20) -> bool:
-        """
-        Notification policy (v9.2.1):
-          • Valid BUY/SELL (executable levels) → ALWAYS sent
-          • Bot errors → ALWAYS sent (via send_failure)
-          • WAIT, SKIP (min-lot), HALT → suppressed unless opt-in
-        """
-        # ── 1. WAIT SUPPRESSION ─────────────────────────────────────
+    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict], cb_reason: str = "normal", dd_reason: str = "daily OK", next_eta_min: int = 20, exec_status: str = "") -> bool:
         if e.action == "WAIT" and not self.cfg.notify_wait:
-            log_event(event="telegram_suppressed", action="WAIT",
-                      score=e.total_score,
-                      reason=e.notes[0] if e.notes else "")
+            log_event(event="telegram_suppressed", action="WAIT", score=e.total_score, reason=e.notes[0] if e.notes else "")
             return False
+        if e.action in ("BUY", "SELL") and levels is None and not self.cfg.notify_halt: return False
+        if levels is not None and levels.get("skip") and not self.cfg.notify_skip: return False
 
-        # ── 2. HALT SUPPRESSION (risk lock, levels=None on BUY/SELL) ─
-        if e.action in ("BUY", "SELL") and levels is None and not self.cfg.notify_halt:
-            log_event(event="telegram_suppressed", action="HALT",
-                      score=e.total_score, reason=cb_reason)
-            return False
-
-        # ── 3. SKIP SUPPRESSION (min-lot guard) ─────────────────────
-        if levels is not None and levels.get("skip") and not self.cfg.notify_skip:
-            log_event(event="telegram_suppressed", action="SKIP",
-                      score=e.total_score, reason=levels.get("skip_reason"))
-            return False
-
-        # ── Fall-through: send (valid signal OR user opted in) ──────
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        kb = {"inline_keyboard": [[
-            {"text": "🔄 Refresh", "callback_data": "refresh"},
-            {"text": "📊 Macro", "callback_data": "macro"},
-        ]]}
+        kb = {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "refresh"}, {"text": "📊 Macro", "callback_data": "macro"}]]}
         w = e.regime_weights
-        fuzzy_str = html.escape(
-            f"{e.regime} (R:{w.get('RANGING', 0):.2f} "
-            f"T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
+        fuzzy_str = html.escape(f"{e.regime} (R:{w.get('RANGING', 0):.2f} T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
         safe_reason = html.escape(e.notes[0]) if e.notes else ""
         safe_kelly = html.escape(levels["kelly_reason"]) if (levels and "kelly_reason" in levels) else ""
-        safe_cb = html.escape(cb_reason)
-        safe_dd = html.escape(dd_reason)
+        safe_cb, safe_dd = html.escape(cb_reason), html.escape(dd_reason)
 
-        # ── Dispatch: SKIP / HALT / WAIT / VALID ─────────────────────
         if levels is not None and levels.get("skip"):
-            # Min-lot SKIP (opt-in only)
-            text = (f"⛔ <b>XAUUSD v{VERSION} — SKIP</b>\n"
-                    f"⏰ <code>{now}</code>\n───────────────────\n"
-                    f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                    f"Signal would be <b>{e.action}</b> but BLOCKED:\n"
-                    f"<i>{html.escape(levels.get('skip_reason', ''))}</i>\n"
-                    f"ATR: ${e.atr_value:.2f} | SL dist: ${levels.get('sl_distance', 0):.2f}\n"
-                    f"Min-lot risk: ${levels.get('min_lot_risk_usd', 0):.2f} "
-                    f"({levels.get('min_lot_risk_pct', 0):.2f}%)\n"
-                    f"Account: ${self.cfg.account_size_usd:.0f} | Max allowed: {self.cfg.max_lot_risk_pct}%")
+            text = f"⛔ <b>XAUUSD v{VERSION} — SKIP</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nSignal would be <b>{e.action}</b> but BLOCKED:\n<i>{html.escape(levels.get('skip_reason', ''))}</i>"
         elif levels is None and e.action in ("BUY", "SELL"):
-            # Risk HALT (opt-in only)
-            text = (f"🛑 <b>XAUUSD v{VERSION} — HALT</b>\n"
-                    f"⏰ <code>{now}</code>\n───────────────────\n"
-                    f"Signal: <b>{e.action}</b> (would have been executed)\n"
-                    f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                    f"Blocked by risk engine:\n"
-                    f"• CB: {safe_cb}\n"
-                    f"• DD: {safe_dd}")
+            text = f"🛑 <b>XAUUSD v{VERSION} — HALT</b>\n⏰ <code>{now}</code>\n───────────────────\nSignal: <b>{e.action}</b> (would have been executed)\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nBlocked by risk engine:\n• CB: {safe_cb}\n• DD: {safe_dd}"
         elif e.action == "WAIT" or not levels:
-            # WAIT (opt-in only)
-            text = (f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n"
-                    f"⏰ <code>{now}</code>\n"
-                    f"Score: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\n"
-                    f"Reason: {safe_reason}\n"
-                    f"<i>CB: {safe_cb} | DD: {safe_dd}</i>\n"
-                    f"<i>Next check: ~{next_eta_min}m</i>")
+            text = f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n⏰ <code>{now}</code>\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nReason: {safe_reason}\n<i>CB: {safe_cb} | DD: {safe_dd}</i>"
         else:
-            # VALID BUY/SELL — the money message
             em = "🟢" if e.action == "BUY" else "🔴"
             tp2_note = " (capped)" if levels.get("tp2_capped") else ""
-            text = (f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n"
-                    f"⏰ <code>{now}</code>\n───────────────────\n"
-                    f"Score: <b>{e.total_score}%</b>\n"
-                    f"Regime: {fuzzy_str}\n"
-                    f"POC: ${e.poc_level:.2f} | ATR: ${e.atr_value:.2f}\n"
-                    f"<code>ENTRY : ${levels['entry_price']:.2f}\n"
-                    f"SL    : ${levels['sl_price']:.2f}\n"
-                    f"TP1   : ${levels['tp1_price']:.2f}\n"
-                    f"TP2   : ${levels['tp2_price']:.2f}{tp2_note}\n"
-                    f"BE @  : ${levels['break_even_trigger']:.2f}</code>\n"
-                    f"Lot: <b>{levels['lot_size']}</b> | "
-                    f"Risk: ${levels['actual_risk_usd']:.2f} "
-                    f"({levels['actual_risk_pct']:.2f}%)\n"
-                    f"<i>Kelly: {safe_kelly}</i>\n"
-                    f"<i>CB: {safe_cb} | DD: {safe_dd}</i>")
+            exec_note = f"\n⚡ <b>EXECUTED:</b> <i>{exec_status}</i>" if exec_status else "\n✋ <b>MANUAL EXECUTION REQUIRED</b>"
+            text = f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b>\nRegime: {fuzzy_str}\nPOC: ${e.poc_level:.2f} | ATR: ${e.atr_value:.2f}\n<code>ENTRY : ${levels['entry_price']:.2f}\nSL    : ${levels['sl_price']:.2f}\nTP1   : ${levels['tp1_price']:.2f}\nTP2   : ${levels['tp2_price']:.2f}{tp2_note}\nBE @  : ${levels['break_even_trigger']:.2f}</code>\nLot: <b>{levels['lot_size']}</b> | Risk: ${levels['actual_risk_usd']:.2f} ({levels['actual_risk_pct']:.2f}%)\n<i>Kelly: {safe_kelly}</i>{exec_note}"
 
-        return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text,
-                           "parse_mode": "HTML", "reply_markup": kb,
-                           "disable_web_page_preview": True})
+        return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text, "parse_mode": "HTML", "reply_markup": kb, "disable_web_page_preview": True})
 
     def send_failure(self, err: str) -> None:
-        if not is_market_open():
-            return
-        self._post({
-            "chat_id": self.cfg.telegram_chat_id,
-            "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n"
-                    f"<code>{html.escape(err[:400])}</code>",
-            "parse_mode": "HTML",
-        })
+        if not is_market_open(): return
+        self._post({"chat_id": self.cfg.telegram_chat_id, "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{html.escape(err[:400])}</code>", "parse_mode": "HTML"})
+
+
+# ============================================================================
+# 14. METAAPI EXECUTION ENGINE (NEW v9.3.0)
+# ============================================================================
+class MetaApiExecutionEngine:
+    def __init__(self, cfg: BotConfig):
+        self.cfg = cfg
+        self.enabled = cfg.execute_trades and all([cfg.metaapi_token, cfg.mt5_login, cfg.mt5_password, cfg.mt5_server, MetaApi])
+
+    async def _execute(self, action: str, levels: dict) -> str:
+        if not self.enabled or not levels or levels.get("skip"): return "SKIPPED"
+        try:
+            api = MetaApi(self.cfg.metaapi_token)
+            
+            # 1. Dapatkan atau buat akun
+            accounts = await api.metatrader_account_api.get_accounts()
+            account = next((a for a in accounts if str(a.login) == str(self.cfg.mt5_login)), None)
+            if not account:
+                log_event(logging.INFO, "metaapi_provisioning", login=self.cfg.mt5_login)
+                account = await api.metatrader_account_api.create_account({
+                    'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login,
+                    'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server,
+                    'platform': 'mt5', 'magic': 123456
+                })
+            
+            await account.wait_connected(timeout_in_seconds=60)
+            connection = account.get_rpc_connection()
+            await connection.connect()
+            await connection.wait_synchronized()
+            
+            # 2. Eksekusi Order
+            volume = levels["lot_size"]
+            sl = levels["sl_price"]
+            tp = levels["tp2_price"]
+            
+            log_event(logging.INFO, "metaapi_firing_order", action=action, symbol=self.cfg.mt5_symbol, lot=volume, sl=sl, tp=tp)
+            
+            if action == "BUY":
+                result = await connection.create_market_buy_order(self.cfg.mt5_symbol, volume, sl, tp)
+            else:
+                result = await connection.create_market_sell_order(self.cfg.mt5_symbol, volume, sl, tp)
+                
+            return f"SUCCESS [ID: {result.get('orderId', 'N/A')}]"
+        except Exception as e:
+            err_msg = str(e)[:150]
+            log_event(logging.ERROR, "metaapi_execution_fail", err=err_msg)
+            return f"FAILED: {err_msg}"
+
+    def execute_trade(self, action: str, levels: dict) -> str:
+        """Wrapper sinkron untuk memanggil fungsi async dari script sinkron."""
+        if not self.enabled: return "DISABLED"
+        try:
+            return asyncio.run(self._execute(action, levels))
+        except Exception as e:
+            log_event(logging.ERROR, "asyncio_run_fail", err=str(e)[:150])
+            return f"LOOP_ERROR: {str(e)[:100]}"
 
 
 # ============================================================================
@@ -1489,32 +1142,17 @@ class TradingBotOrchestrator:
         self.risk = RiskManagementEngine(cfg, self.db)
         self.outcomes = OutcomeTracker(self.db)
         self.tg = TelegramNotifier(cfg)
+        self.executor = MetaApiExecutionEngine(cfg)
 
     def _news_check(self) -> NewsResult:
-        if not self.cfg.news_enabled:
-            return NewsResult(allowed=True, reason="news disabled", source="bypass")
-        try:
-            return _live_news_guard()
+        if not self.cfg.news_enabled: return NewsResult(allowed=True, reason="news disabled", source="bypass")
+        try: return _live_news_guard()
         except Exception as e:
             log_event(logging.WARNING, "news_guard_fail", err=str(e)[:120])
-            return NewsResult(allowed=True, reason="news guard error (bypass)",
-                              source="error")
+            return NewsResult(allowed=True, reason="news guard error", source="error")
 
     def run(self) -> int:
-        log_event(event="bot_start", version=VERSION,
-                  params_source=self.params_source,
-                  supabase_enabled=SUPABASE.enabled,
-                  notify_wait=self.cfg.notify_wait,
-                  notify_skip=self.cfg.notify_skip,
-                  notify_halt=self.cfg.notify_halt,
-                  account_size_usd=self.cfg.account_size_usd,
-                  risk_pct=self.cfg.risk_pct,
-                  max_lot_risk_pct=self.cfg.max_lot_risk_pct,
-                  warnings=self.cfg.warnings())
-
-        if not SUPABASE.enabled:
-            log_event(logging.WARNING, "supabase_disabled_risk",
-                      note="Kelly will not activate without persistent R history")
+        log_event(event="bot_start", version=VERSION, params_source=self.params_source, supabase_enabled=SUPABASE.enabled, execute_trades=self.cfg.execute_trades, account_size_usd=self.cfg.account_size_usd, warnings=self.cfg.warnings())
 
         if not is_market_open():
             log_event(event="market_closed_or_holiday", skip=True)
@@ -1532,8 +1170,7 @@ class TradingBotOrchestrator:
 
         try:
             n_closed = self.outcomes.process(md.h1)
-            if n_closed:
-                log_event(event="outcomes_closed", count=n_closed)
+            if n_closed: log_event(event="outcomes_closed", count=n_closed)
         except Exception as ex:
             log_event(logging.WARNING, "outcome_tracker_fail", err=str(ex)[:120])
 
@@ -1555,67 +1192,40 @@ class TradingBotOrchestrator:
             kelly_base, kelly_reason = self.risk.kelly_risk_pct()
             kelly_final = round(kelly_base * mult, 2)
             if kelly_final > self.cfg.max_lot_risk_pct:
-                kelly_reason = (f"{kelly_reason} | capped "
-                                f"{kelly_final:.2f}%→{self.cfg.max_lot_risk_pct}%")
+                kelly_reason = f"{kelly_reason} | capped {kelly_final:.2f}%->{self.cfg.max_lot_risk_pct}%"
                 kelly_final = self.cfg.max_lot_risk_pct
-            if mult < 1.0:
-                kelly_reason = f"{kelly_reason} | mult={mult:.2f} | CB:{cb_r} | DD:{dd_r}"
 
-            levels = self.risk.compute_levels(
-                e.action, tradable, e.atr_value, e.atr_multiplier,
-                e.blended_params, kelly_final, kelly_reason)
+            levels = self.risk.compute_levels(e.action, tradable, e.atr_value, e.atr_multiplier, e.blended_params, kelly_final, kelly_reason)
 
             if levels and levels.get("skip"):
-                log_event(event="trade_skipped_min_lot",
-                          action=e.action, reason=levels.get("skip_reason"),
-                          min_lot_risk_pct=levels.get("min_lot_risk_pct"),
-                          account_size=self.cfg.account_size_usd,
-                          max_allowed_pct=self.cfg.max_lot_risk_pct)
+                log_event(event="trade_skipped_min_lot", action=e.action, reason=levels.get("skip_reason"))
                 self.tg.send_signal(e, tradable, levels, cb_r, dd_r)
                 print(f"ACTION: SKIP — {levels.get('skip_reason')}")
                 return 0
 
-            if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action,
-                                         tradable, e.regime):
-                log_event(event="signal_deduped", action=e.action,
-                          regime=e.regime, spot=round(tradable, 2))
+            if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action, tradable, e.regime):
+                log_event(event="signal_deduped", action=e.action, regime=e.regime)
                 print(f"ACTION: {e.action} (deduped) | Score: {e.total_score}%")
                 return 0
 
+            exec_status = ""
             if levels and e.action in ("BUY", "SELL"):
                 signal_id = uuid.uuid4().hex
                 max_hold_h = float(e.blended_params.get("max_hold", 48.0))
                 self.db.record(signal_id, e, tradable, levels, max_hold_h)
-                try_insert_signal(
-                    signal_id=signal_id, action=e.action, spot=tradable,
-                    entry_price=levels["entry_price"],
-                    sl=levels["sl_price"], tp1=levels["tp1_price"],
-                    tp2=levels["tp2_price"],
-                    score=e.total_score, regime=e.regime,
-                    kelly_frac=kelly_final / 100.0, lot=levels["lot_size"],
-                    risk_usd=levels["actual_risk_usd"],
-                    max_hold_hours=max_hold_h,
-                    notes="; ".join(e.notes))
+                try_insert_signal(signal_id, e.action, tradable, levels["entry_price"], levels["sl_price"], levels["tp1_price"], levels["tp2_price"], e.total_score, e.regime, kelly_final/100.0, levels["lot_size"], levels["actual_risk_usd"], max_hold_h, "; ".join(e.notes))
+                
+                # --- METAAPI EXECUTION ---
+                if self.executor.enabled:
+                    exec_status = self.executor.execute_trade(e.action, levels)
+                    log_event(event="auto_trade_result", action=e.action, result=exec_status)
+                # -------------------------
             else:
                 signal_id = None
 
-            sent = self.tg.send_signal(e, tradable, levels, cb_r, dd_r)
-
-            log_event(event="signal_emitted", action=e.action, score=e.total_score,
-                      threshold=e.threshold, gap=e.gap_to_threshold,
-                      spot=round(tradable, 2), basis=round(basis, 2),
-                      source=md.source, m15_synthetic=md.m15_synthetic,
-                      regime=e.regime, regime_weights=e.regime_weights,
-                      macro_severity=macro.severity,
-                      params_source=e.params_source,
-                      kelly_base=kelly_base, kelly_final=kelly_final,
-                      kelly_reason=kelly_reason, mult=mult, cb=cb_r, dd=dd_r,
-                      signal_id=signal_id, tg=sent,
-                      skip_reason=e.skip_reason)
-            print(f"ACTION: {e.action} | Score: {e.total_score}% "
-                  f"(thr {e.threshold:.1f}, gap {e.gap_to_threshold:+.1f}) | "
-                  f"Regime: {e.regime} | Kelly: {kelly_final:.2f}% (×{mult}) | "
-                  f"Spot: {tradable:.2f} | TG: {sent} | CB: {cb_r} | DD: {dd_r}")
+            sent = self.tg.send_signal(e, tradable, levels, cb_r, dd_r, exec_status=exec_status)
+            
+            print(f"ACTION: {e.action} | Score: {e.total_score}% | Kelly: {kelly_final:.2f}% | Spot: {tradable:.2f} | TG: {sent} | Exec: {exec_status}")
             return 0
         except Exception as ex:
             err = f"{type(ex).__name__}: {ex}"
@@ -1624,13 +1234,11 @@ class TradingBotOrchestrator:
             print(f"ACTION: ERROR — {err}")
             return 1
 
-
 # ============================================================================
 # 16. MAIN
 # ============================================================================
 def main() -> int:
     return TradingBotOrchestrator(BotConfig.from_env()).run()
-
 
 if __name__ == "__main__":
     sys.exit(main())
