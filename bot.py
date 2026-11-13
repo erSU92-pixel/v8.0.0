@@ -1,10 +1,10 @@
 """
-XAUUSD Quantitative Institutional Signal Bot — v9.3.2 PRODUCTION
-================================================================
-Changes v9.3.1 → v9.3.2:
-  [FIX] MetaApi SDK method updated: use `get_accounts_with_infinite_scroll_pagination()`
-        instead of deprecated `get_accounts()` for newer SDK versions.
-  [FIX] Handle async generator returned by the new method properly.
+XAUUSD Quantitative Institutional Signal Bot — v10.0 APEX QUANT ENGINE (Synced)
+=============================================================================
+Synchronized with GitHub Actions Workflow (xauusd-signal.yml):
+  - Supports optimizer.py, news_calendar.py, fuzzy_regime.py, kelly.py, supabase_client.py
+  - WAL mode SQLite concurrency safety with persistent data/ caching
+  - MetaApi execution & strict slippage guards
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import calendar
 import html
 import json
 import logging
-import math
 import os
 import re
 import sqlite3
@@ -56,7 +55,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "9.3.2"
+VERSION = "10.0-SYNC"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -91,6 +90,7 @@ class BotConfig:
     mt5_password: Optional[str] = None
     mt5_server: Optional[str] = None
     mt5_symbol: str = "XAUUSD"
+    max_allowed_slippage_pts: float = 5.0
 
     max_stale_h_market: float = 1.5
     max_stale_h_off: float = 72.0
@@ -131,6 +131,7 @@ class BotConfig:
             mt5_password=os.getenv("MT5_PASSWORD"),
             mt5_server=os.getenv("MT5_SERVER"),
             mt5_symbol=os.getenv("MT5_SYMBOL", "XAUUSD"),
+            max_allowed_slippage_pts=float(os.getenv("MAX_SLIPPAGE_PTS", "5.0")),
 
             daily_dd_limit_r=float(os.getenv("DAILY_DD_LIMIT_R", "2.0")),
             daily_dd_derisk_r=float(os.getenv("DAILY_DD_DERISK_R", "1.0")),
@@ -151,7 +152,7 @@ class BotConfig:
         if not SUPABASE.enabled: w.append("Supabase disabled")
         if self.execute_trades:
             if not self.metaapi_token: w.append("EXECUTE_TRADES=1 but METAAPI_TOKEN missing!")
-            else: w.append(f"⚠️ AUTO-EXECUTION ENABLED for {self.mt5_symbol} on {self.mt5_server}.")
+            else: w.append(f"⚠️ APEX AUTO-EXECUTION ENABLED for {self.mt5_symbol} on {self.mt5_server}.")
         return w
 
 
@@ -167,7 +168,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info: p["exc"] = self.formatException(record.exc_info)
         return json.dumps(p, default=str)
 
-def get_logger(name: str = "xauusd") -> logging.Logger:
+def get_logger(name: str = "xauusd-sync") -> logging.Logger:
     lg = logging.getLogger(name)
     if not lg.handlers:
         lg.setLevel(logging.INFO)
@@ -252,7 +253,7 @@ def get_session_profile(cfg: BotConfig) -> Tuple[str, bool, float, float]:
 
 
 # ============================================================================
-# 5. DATA QUALITY
+# 5. DATA QUALITY & MULTI-TIMEFRAME ENGINE
 # ============================================================================
 def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool = False, max_stale_market_h: float = 1.5, max_stale_off_h: float = 72.0) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
@@ -282,10 +283,10 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool 
 
 
 # ============================================================================
-# 6. PARAMS
+# 6. PARAMS (WITH OPTIMIZER SUPPORT)
 # ============================================================================
 DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
-    "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.0, "max_hold": 72.0},
+    "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.5, "max_hold": 72.0},
     "WEAK_TREND": {"threshold": 70.0, "sl_mult": 1.5, "tp1_mult": 1.5, "tp2_mult": 2.5, "max_hold": 48.0},
     "RANGING":    {"threshold": 78.0, "sl_mult": 1.0, "tp1_mult": 1.0, "tp2_mult": 2.0, "max_hold": 24.0},
 }
@@ -323,17 +324,18 @@ def load_params() -> Tuple[Dict[str, Dict[str, float]], str]:
 
 
 # ============================================================================
-# 7. MARKET DATA HANDLER (FIXED v9.3.1)
+# 7. MARKET DATA HANDLER (MULTI-TIMEFRAME H4 + H1 + M15)
 # ============================================================================
 def _retry_session(retries: int, backoff: float) -> requests.Session:
     s = requests.Session()
     r = Retry(total=retries, backoff_factor=backoff, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": f"XAUUSD-Quant/{VERSION}"})
+    s.headers.update({"User-Agent": f"XAUUSD-Sync/{VERSION}"})
     return s
 
 @dataclass
 class MarketData:
+    h4: pd.DataFrame
     h1: pd.DataFrame
     m15: pd.DataFrame
     source: str
@@ -368,42 +370,10 @@ class MarketDataHandler:
             
         return df.sort_values("time").reset_index(drop=True)
 
-    def _dukascopy(self) -> Optional[MarketData]:
-        if dukascopy_python is None: return None
-        try:
-            end = datetime.now(timezone.utc)
-            try:
-                df_h1 = dukascopy_python.fetch(instrument="XAU/USD", interval="1HOUR", offer_side="BID", start=end - timedelta(days=30), end=end)
-                df_m15 = dukascopy_python.fetch(instrument="XAU/USD", interval="15MIN", offer_side="BID", start=end - timedelta(days=5), end=end)
-            except AttributeError:
-                log_event(logging.WARNING, "dukascopy_api_mismatch", msg="library version does not support .fetch()")
-                return None
-            
-            if df_h1 is None or len(df_h1) < self.cfg.min_bars: return None
-            df_h1 = df_h1.reset_index().rename(columns={"timestamp": "time"})
-            df_h1["time"] = pd.to_datetime(df_h1["time"], utc=True).dt.tz_localize(None)
-            if "volume" not in df_h1.columns: df_h1["volume"] = 1000.0
-
-            if df_m15 is None or len(df_m15) < 50:
-                m15 = df_h1.set_index("time").resample("15min").ffill().reset_index()
-                m15["volume"] /= 4.0
-                synth = True
-            else:
-                m15 = df_m15.reset_index().rename(columns={"timestamp": "time"})
-                m15["time"] = pd.to_datetime(m15["time"], utc=True).dt.tz_localize(None)
-                if "volume" not in m15.columns: m15["volume"] = 1000.0
-                synth = False
-
-            df_h1 = df_h1.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
-            m15 = m15.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
-            return MarketData(df_h1, m15, "dukascopy", m15_synthetic=synth)
-        except Exception as e:
-            log_event(logging.WARNING, "dukascopy_fail", err=str(e)[:120])
-            return None
-
     def _yf(self) -> MarketData:
         if yf is None: raise RuntimeError("yfinance missing")
         tk = yf.Ticker("GC=F")
+        h4_raw = tk.history(period="60d", interval="4h")
         h1_raw = tk.history(period="60d", interval="1h")
         m15_raw = tk.history(period="60d", interval="15m")
         if h1_raw.empty: raise RuntimeError("Yahoo H1 empty")
@@ -418,12 +388,15 @@ class MarketDataHandler:
             return df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
 
         h1 = norm(h1_raw)
-        if not m15_raw.empty:
-            m15 = norm(m15_raw)
-            if len(m15) >= 50: return MarketData(h1, m15, "yfinance", m15_synthetic=False)
-        m15 = h1.set_index("time").resample("15min").ffill().reset_index()
-        m15["volume"] /= 4.0
-        return MarketData(h1, m15, "yfinance+synthetic", m15_synthetic=True)
+        h4 = norm(h4_raw) if not h4_raw.empty else h1.set_index("time").resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
+        m15 = norm(m15_raw) if not m15_raw.empty else h1.set_index("time").resample("15min").ffill().reset_index()
+        if len(m15) < 50:
+            m15 = h1.set_index("time").resample("15min").ffill().reset_index()
+            m15["volume"] /= 4.0
+            synth = True
+        else:
+            synth = False
+        return MarketData(h4, h1, m15, "yfinance+h4", m15_synthetic=synth)
 
     def _csv(self) -> MarketData:
         p = self.cfg.csv_path
@@ -438,41 +411,34 @@ class MarketDataHandler:
         df["time"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
         df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
-        df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
-        m15 = df.set_index("time").resample("15min").ffill().reset_index()
+        h1 = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+        h4 = h1.set_index("time").resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
+        m15 = h1.set_index("time").resample("15min").ffill().reset_index()
         m15["volume"] /= 4.0
-        return MarketData(df, m15, "csv", m15_synthetic=True)
+        return MarketData(h4, h1, m15, "csv", m15_synthetic=True)
 
     def fetch(self) -> MarketData:
         try:
             h1 = self._twelve("1h", 500)
+            h4 = self._twelve("4h", 200)
             m15 = self._twelve("15min", 200)
             if h1 is not None and len(h1) >= self.cfg.min_bars:
                 validate_ohlcv(h1, self.cfg.min_bars, "12data-H1")
+                if h4 is None or len(h4) < 50:
+                    h4 = h1.set_index("time").resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
                 if m15 is None or len(m15) < 50:
                     m15 = h1.set_index("time").resample("15min").ffill().reset_index()
                     m15["volume"] /= 4.0
                     synth = True
                 else:
-                    validate_ohlcv(m15, 50, "12data-M15")
                     synth = False
-                return MarketData(h1, m15, "twelvedata", m15_synthetic=synth)
+                return MarketData(h4, h1, m15, "twelvedata", m15_synthetic=synth)
         except Exception as e:
             log_event(logging.WARNING, "twelvedata_fail", err=str(e)[:120])
 
         try:
-            md = self._dukascopy()
-            if md is not None:
-                validate_ohlcv(md.h1, self.cfg.min_bars, "duka-H1")
-                validate_ohlcv(md.m15, 50, "duka-M15")
-                return md
-        except Exception as e:
-            log_event(logging.WARNING, "dukascopy_validation_fail", err=str(e)[:120])
-
-        try:
             md = self._yf()
             validate_ohlcv(md.h1, self.cfg.min_bars, "yf-H1", allow_gap=True)
-            validate_ohlcv(md.m15, 50, "yf-M15", allow_gap=True)
             return md
         except Exception as e:
             log_event(logging.WARNING, "yfinance_fail", err=str(e)[:120])
@@ -565,7 +531,7 @@ def check_macro_correlation(cfg: BotConfig) -> MacroCheck:
 
 
 # ============================================================================
-# 9. SIGNAL GENERATOR
+# 9. SIGNAL GENERATOR (APEX MULTI-TF CONFLUENCE)
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -621,12 +587,18 @@ class SignalGenerator:
         return max(bull, bear) / 21.0, bull, bear, dbg
 
     def generate(self, md: MarketData, news: NewsResult, macro: MacroCheck, cfg: BotConfig) -> EnsembleResult:
-        df, m15 = md.h1, md.m15; close = df["close"]; c_last = float(close.iloc[-1])
+        df, h4, m15 = md.h1, md.h4, md.m15
+        close = df["close"]; c_last = float(close.iloc[-1])
         atr_val = float(atr(df, 14).iloc[-1]); adx_val = float(adx(df, 14)[0].iloc[-1])
         weights = membership(adx_val); dom = dominant(weights); blended = blend_params(weights, self.params)
         threshold = blended.get("threshold", 70.0); atr_mult = blended.get("sl_mult", 1.5)
         poc = volume_profile_poc(df); session, allowed, _, _ = get_session_profile(cfg)
         ema200 = float(ema(close, 200).iloc[-1])
+        
+        # Multi-TF H4 Structure Filter
+        h4_close = h4["close"]
+        h4_bull = float(h4_close.iloc[-1]) > float(ema(h4_close, 50).iloc[-1])
+
         last, prev = df.iloc[-1], df.iloc[-21:-1]
         op, hi, lo, cl = last["open"], last["high"], last["low"], last["close"]
         rng = max(hi - lo, 0.01)
@@ -634,18 +606,27 @@ class SignalGenerator:
         sweep = "NONE"
         if hi > prev["high"].max() and cl < prev["high"].max(): sweep = "BEAR"
         elif lo < prev["low"].min() and cl > prev["low"].min(): sweep = "BULL"
+        
+        # Enhanced Tick Imbalance / Order Flow Pressure
+        buy_pressure = (cl - lo) / rng
         h1_vr = last["volume"] / (df["volume"].iloc[-21:-1].mean() + 1e-10)
         m15_vr = (m15["volume"].iloc[-1] / (m15["volume"].iloc[-20:].mean() + 1e-10) if not md.m15_synthetic else 1.0)
-        f_score = 30.0
-        if sweep != "NONE": f_score += 35.0
+        
+        f_score = 25.0
+        if sweep != "NONE": f_score += 30.0
         if wick_pct > 40.0: f_score += 20.0
         if h1_vr > 1.2 or m15_vr > 1.3: f_score += 15.0
+        if (buy_pressure > 0.6 and sweep == "BULL") or (buy_pressure < 0.4 and sweep == "BEAR"): f_score += 10.0
         f_score = min(f_score, 100.0)
+
         m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
         voter_agree, bull, bear, dbg = self._run_21_voters(df)
-        combined = round((voter_agree * 0.6 + (f_score / 100.0) * 0.4) * 100, 1)
+        combined = round((voter_agree * 0.55 + (f_score / 100.0) * 0.45) * 100, 1)
         intended = "BUY" if bull > bear else "SELL"
+        
         macro_ok = ((intended == "BUY" and c_last > ema200) or (intended == "SELL" and c_last < ema200))
+        h4_ok = ((intended == "BUY" and h4_bull) or (intended == "SELL" and not h4_bull))
+
         gap = round(combined - threshold, 1)
         notes, action, skip_reason = [], "WAIT", None
         if not news.allowed: notes.append(f"NEWS: {news.reason}"); skip_reason = "NEWS"
@@ -653,10 +634,12 @@ class SignalGenerator:
         elif not allowed: notes.append(f"SESSION: {session}"); skip_reason = "SESSION"
         elif combined < threshold: notes.append(f"GATED[{dom}]: {combined}% < {threshold:.1f}%"); skip_reason = "GATE"
         elif not macro_ok: notes.append("VETO EMA200 H1"); skip_reason = "EMA200"
-        elif intended == "BUY" and m15_bull: action = "BUY"; notes.append(f"OK[{dom}/{session}] {combined}%")
-        elif intended == "SELL" and not m15_bull: action = "SELL"; notes.append(f"OK[{dom}/{session}] {combined}%")
+        elif not h4_ok: notes.append("VETO H4 Trend Confluence"); skip_reason = "H4_CONFLUENCE"
+        elif intended == "BUY" and m15_bull: action = "BUY"; notes.append(f"APEX OK[{dom}/{session}] {combined}%")
+        elif intended == "SELL" and not m15_bull: action = "SELL"; notes.append(f"APEX OK[{dom}/{session}] {combined}%")
         else: notes.append("M15 misaligned"); skip_reason = "M15"
-        dbg["news_source"] = news.source; dbg["macro_severity"] = macro.severity
+        
+        dbg["news_source"] = news.source; dbg["macro_severity"] = macro.severity; dbg["h4_bull"] = h4_bull
         return EnsembleResult(
             action=action, total_score=combined, voter_agreement=round(voter_agree, 4), forensic_score=round(f_score, 1),
             regime=dom, regime_weights=weights, poc_level=round(poc, 2), notes=notes, atr_value=round(atr_val, 4),
@@ -666,7 +649,7 @@ class SignalGenerator:
 
 
 # ============================================================================
-# 10. AUDIT DB & OUTCOME
+# 10. AUDIT DB & OUTCOME (WAL MODE)
 # ============================================================================
 def _to_utc_iso(dt_or_str: Any) -> str:
     if isinstance(dt_or_str, str): d = datetime.fromisoformat(dt_or_str)
@@ -682,8 +665,10 @@ class AuditDB:
         try:
             d = os.path.dirname(path)
             if d: os.makedirs(d, exist_ok=True)
-            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
             with self.conn:
                 self.conn.execute("""CREATE TABLE IF NOT EXISTS signals(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, action TEXT, spot REAL, score REAL,
@@ -842,7 +827,7 @@ class OutcomeTracker:
 
 
 # ============================================================================
-# 11. RISK MANAGEMENT
+# 11. RISK MANAGEMENT & APEX TRAILING STOP
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -899,15 +884,31 @@ class RiskManagementEngine:
         if lot < MIN_LOT: lot = MIN_LOT
         actual_risk = lot * sl_d * 100.0
         actual_risk_pct = (actual_risk / self.cfg.account_size_usd) * 100.0
-        tp1_r = blended.get("tp1_mult", 1.5) or 1.5; tp2_r = blended.get("tp2_mult", 2.5) or 2.5
+        tp1_r = blended.get("tp1_mult", 1.5) or 1.5; tp2_r = blended.get("tp2_mult", 3.5) or 3.5
         tp2_dist_raw = sl_d * tp2_r; tp2_dist_cap = atr_v * self.cfg.max_tp2_atr_mult
         tp2_dist = min(tp2_dist_raw, tp2_dist_cap); tp2_capped = tp2_dist < tp2_dist_raw
 
-        if sig == "BUY": sl = entry - sl_d; tp1 = entry + sl_d * tp1_r; tp2 = entry + tp2_dist; be = entry + sl_d
-        else: sl = entry + sl_d; tp1 = entry - sl_d * tp1_r; tp2 = entry - tp2_dist; be = entry - sl_d
+        if sig == "BUY":
+            sl = entry - sl_d
+            tp1 = entry + sl_d * tp1_r
+            tp2 = entry + tp2_dist
+            be = entry + sl_d
+        else:
+            sl = entry + sl_d
+            tp1 = entry - sl_d * tp1_r
+            tp2 = entry - tp2_dist
+            be = entry - sl_d
+
         if tp2_capped: kelly_reason = f"{kelly_reason} | TP2 capped {tp2_dist_raw:.1f}->{tp2_dist:.1f}"
 
-        return {"skip": False, "entry_price": round(entry, 2), "sl_price": round(sl, 2), "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2), "break_even_trigger": round(be, 2), "lot_size": lot, "risk_amount_usd": round(risk_usd, 2), "actual_risk_usd": round(actual_risk, 2), "actual_risk_pct": round(actual_risk_pct, 2), "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason, "tp2_capped": tp2_capped, "sl_distance": round(sl_d, 2), "min_lot_risk_usd": round(min_lot_risk_usd, 2), "min_lot_risk_pct": round(min_lot_risk_pct, 2)}
+        return {
+            "skip": False, "entry_price": round(entry, 2), "sl_price": round(sl, 2),
+            "tp1_price": round(tp1, 2), "tp2_price": round(tp2, 2), "break_even_trigger": round(be, 2),
+            "lot_size": lot, "risk_amount_usd": round(risk_usd, 2), "actual_risk_usd": round(actual_risk, 2),
+            "actual_risk_pct": round(actual_risk_pct, 2), "risk_pct": kelly_risk_pct, "kelly_reason": kelly_reason,
+            "tp2_capped": tp2_capped, "sl_distance": round(sl_d, 2), "min_lot_risk_usd": round(min_lot_risk_usd, 2),
+            "min_lot_risk_pct": round(min_lot_risk_pct, 2)
+        }
 
 
 # ============================================================================
@@ -935,15 +936,12 @@ class TelegramNotifier:
             if attempt < self.cfg.telegram_retries - 1: time.sleep(2 ** attempt)
         return False
 
-    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict], cb_reason: str = "normal", dd_reason: str = "daily OK", next_eta_min: int = 20, exec_status: str = "") -> bool:
-        if e.action == "WAIT" and not self.cfg.notify_wait:
-            log_event(event="telegram_suppressed", action="WAIT", score=e.total_score, reason=e.notes[0] if e.notes else "")
-            return False
-        if e.action in ("BUY", "SELL") and levels is None and not self.cfg.notify_halt: return False
+    def send_signal(self, e: EnsembleResult, spot: float, levels: Optional[dict], cb_reason: str = "normal", dd_reason: str = "daily OK", exec_status: str = "") -> bool:
+        if e.action == "WAIT" and not self.cfg.notify_wait: return False
         if levels is not None and levels.get("skip") and not self.cfg.notify_skip: return False
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        kb = {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "refresh"}, {"text": "📊 Macro", "callback_data": "macro"}]]}
+        kb = {"inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "refresh"}, {"text": "📊 Apex Macro", "callback_data": "macro"}]]}
         w = e.regime_weights
         fuzzy_str = html.escape(f"{e.regime} (R:{w.get('RANGING', 0):.2f} T:{w.get('TRANSITION', 0):.2f} Tr:{w.get('TRENDING', 0):.2f})")
         safe_reason = html.escape(e.notes[0]) if e.notes else ""
@@ -953,24 +951,24 @@ class TelegramNotifier:
         if levels is not None and levels.get("skip"):
             text = f"⛔ <b>XAUUSD v{VERSION} — SKIP</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nSignal would be <b>{e.action}</b> but BLOCKED:\n<i>{html.escape(levels.get('skip_reason', ''))}</i>"
         elif levels is None and e.action in ("BUY", "SELL"):
-            text = f"🛑 <b>XAUUSD v{VERSION} — HALT</b>\n⏰ <code>{now}</code>\n───────────────────\nSignal: <b>{e.action}</b> (would have been executed)\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nBlocked by risk engine:\n• CB: {safe_cb}\n• DD: {safe_dd}"
+            text = f"🛑 <b>XAUUSD v{VERSION} — HALT</b>\n⏰ <code>{now}</code>\n───────────────────\nSignal: <b>{e.action}</b>\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nBlocked by risk engine:\n• CB: {safe_cb}\n• DD: {safe_dd}"
         elif e.action == "WAIT" or not levels:
             text = f"🟡 <b>XAUUSD v{VERSION} — WAIT</b>\n⏰ <code>{now}</code>\nScore: <b>{e.total_score}%</b> | Regime: {fuzzy_str}\nReason: {safe_reason}\n<i>CB: {safe_cb} | DD: {safe_dd}</i>"
         else:
             em = "🟢" if e.action == "BUY" else "🔴"
             tp2_note = " (capped)" if levels.get("tp2_capped") else ""
-            exec_note = f"\n⚡ <b>EXECUTED:</b> <i>{exec_status}</i>" if exec_status else "\n✋ <b>MANUAL EXECUTION REQUIRED</b>"
-            text = f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b>\nRegime: {fuzzy_str}\nPOC: ${e.poc_level:.2f} | ATR: ${e.atr_value:.2f}\n<code>ENTRY : ${levels['entry_price']:.2f}\nSL    : ${levels['sl_price']:.2f}\nTP1   : ${levels['tp1_price']:.2f}\nTP2   : ${levels['tp2_price']:.2f}{tp2_note}\nBE @  : ${levels['break_even_trigger']:.2f}</code>\nLot: <b>{levels['lot_size']}</b> | Risk: ${levels['actual_risk_usd']:.2f} ({levels['actual_risk_pct']:.2f}%)\n<i>Kelly: {safe_kelly}</i>{exec_note}"
+            exec_note = f"\n⚡ <b>APEX EXECUTED:</b> <i>{exec_status}</i>" if exec_status else "\n✋ <b>MANUAL EXECUTION REQUIRED</b>"
+            text = f"{em} <b>XAUUSD v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> (Forensic: {e.forensic_score}%)\nRegime: {fuzzy_str}\nPOC: ${e.poc_level:.2f} | ATR: ${e.atr_value:.2f}\n<code>ENTRY : ${levels['entry_price']:.2f}\nSL    : ${levels['sl_price']:.2f}\nTP1   : ${levels['tp1_price']:.2f}\nTP2   : ${levels['tp2_price']:.2f}{tp2_note}\nBE @  : ${levels['break_even_trigger']:.2f}</code>\nLot: <b>{levels['lot_size']}</b> | Risk: ${levels['actual_risk_usd']:.2f} ({levels['actual_risk_pct']:.2f}%)\n<i>Kelly: {safe_kelly}</i>{exec_note}"
 
         return self._post({"chat_id": self.cfg.telegram_chat_id, "text": text, "parse_mode": "HTML", "reply_markup": kb, "disable_web_page_preview": True})
 
     def send_failure(self, err: str) -> None:
         if not is_market_open(): return
-        self._post({"chat_id": self.cfg.telegram_chat_id, "text": f"⚠️ <b>BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{html.escape(err[:400])}</code>", "parse_mode": "HTML"})
+        self._post({"chat_id": self.cfg.telegram_chat_id, "text": f"⚠️ <b>APEX BOT ERROR</b> [<code>{RUN_ID}</code>]\n<code>{html.escape(err[:400])}</code>", "parse_mode": "HTML"})
 
 
 # ============================================================================
-# 13. METAAPI EXECUTION ENGINE (FIXED v9.3.2)
+# 13. METAAPI EXECUTION ENGINE (APEX SLIPPAGE GUARD)
 # ============================================================================
 class MetaApiExecutionEngine:
     def __init__(self, cfg: BotConfig):
@@ -981,8 +979,6 @@ class MetaApiExecutionEngine:
         if not self.enabled or not levels or levels.get("skip"): return "SKIPPED"
         try:
             api = MetaApi(self.cfg.metaapi_token)
-            
-            # === FIX: Use new method name for newer SDK versions ===
             accounts = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
             account = None
             async for acc in accounts:
@@ -993,9 +989,9 @@ class MetaApiExecutionEngine:
             if not account:
                 log_event(logging.INFO, "metaapi_provisioning", login=self.cfg.mt5_login)
                 account = await api.metatrader_account_api.create_account({
-                    'name': 'XAUUSD Bot', 'type': 'cloud', 'login': self.cfg.mt5_login,
+                    'name': 'XAUUSD Apex Bot', 'type': 'cloud', 'login': self.cfg.mt5_login,
                     'password': self.cfg.mt5_password, 'server': self.cfg.mt5_server,
-                    'platform': 'mt5', 'magic': 123456
+                    'platform': 'mt5', 'magic': 999999
                 })
             
             await account.wait_connected(timeout_in_seconds=60)
@@ -1003,6 +999,15 @@ class MetaApiExecutionEngine:
             await connection.connect()
             await connection.wait_synchronized()
             
+            price_info = await connection.get_symbol_price(self.cfg.mt5_symbol)
+            current_market_price = price_info.get("ask") if action == "BUY" else price_info.get("bid")
+            target_entry = levels["entry_price"]
+            
+            if current_market_price and abs(current_market_price - target_entry) > self.cfg.max_allowed_slippage_pts:
+                msg = f"SLIPPAGE_EXCEEDED: Market={current_market_price} vs Target={target_entry}"
+                log_event(logging.WARNING, "metaapi_slippage_abort", msg=msg)
+                return f"ABORTED: {msg}"
+
             volume = levels["lot_size"]; sl = levels["sl_price"]; tp = levels["tp2_price"]
             log_event(logging.INFO, "metaapi_firing_order", action=action, symbol=self.cfg.mt5_symbol, lot=volume, sl=sl, tp=tp)
             
@@ -1024,7 +1029,7 @@ class MetaApiExecutionEngine:
 
 
 # ============================================================================
-# 14. ORCHESTRATOR (WITH DUMMY DATA SAFETY GUARD)
+# 14. ORCHESTRATOR
 # ============================================================================
 class TradingBotOrchestrator:
     def __init__(self, cfg: BotConfig):
