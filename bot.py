@@ -534,9 +534,13 @@ class MetaApiExecutionEngine:
             try:
                 api = MetaApi(self.cfg.metaapi_token)
                 accounts = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+                
                 account = None
-                async for acc in accounts:
-                    if str(acc.login) == str(self.cfg.mt5_login): account = acc; break
+                # FIX: Gunakan perulangan 'for' biasa karena accounts adalah list
+                for acc in accounts:
+                    if str(acc.login) == str(self.cfg.mt5_login):
+                        account = acc
+                        break
                 
                 if not account: return f"FAILED: Account login {self.cfg.mt5_login} not found"
 
@@ -562,7 +566,6 @@ class MetaApiExecutionEngine:
                 if attempt == 3: return f"FAILED: {err_msg[:120]}"
                 await asyncio.sleep(2 ** attempt)
         return "FAILED: Max retries exhausted"
-
     def execute_trade(self, symbol: str, action: str, levels: dict) -> str:
         if not self.enabled: return "DISABLED"
         try: return asyncio.run(self._execute(symbol, action, levels))
