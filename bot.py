@@ -480,7 +480,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 8. RISK MANAGEMENT & EXECUTION ENGINE
+# 8. RISK MANAGEMENT & ENHANCED METAAPI EXECUTION ENGINE
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig): self.cfg = cfg
@@ -512,7 +512,7 @@ class MetaApiExecutionEngine:
         self.enabled = cfg.execute_trades and all([cfg.metaapi_token, cfg.mt5_login, cfg.mt5_password, cfg.mt5_server, MetaApi])
 
     async def _execute(self, symbol: str, action: str, levels: dict) -> str:
-        if not self.enabled or not levels or levels.get("skip"): return "SKIPPED"
+        if not self.enabled or not levels or levels.get("skip"): return "DISABLED/SKIPPED"
         prof = ASSET_PROFILES.get(symbol, ASSET_PROFILES["XAUUSD"])
         
         for attempt in range(1, 4):
@@ -523,29 +523,42 @@ class MetaApiExecutionEngine:
                 async for acc in accounts:
                     if str(acc.login) == str(self.cfg.mt5_login): account = acc; break
                 
+                if not account:
+                    return f"FAILED: Account login {self.cfg.mt5_login} not found on MetaApi"
+
                 await account.wait_connected(timeout_in_seconds=60)
                 connection = account.get_rpc_connection()
                 await connection.connect()
                 await connection.wait_synchronized()
                 
+                # Check symbol pricing & spread
                 price_info = await connection.get_symbol_price(symbol)
-                spread_pts = abs(float(price_info.get("ask", 0)) - float(price_info.get("bid", 0)))
+                ask = float(price_info.get("ask", 0))
+                bid = float(price_info.get("bid", 0))
+                spread_pts = abs(ask - bid)
                 
-                if spread_pts > prof.max_spread_pts:
-                    return f"ABORTED: SPREAD_TOO_WIDE ({spread_pts:.1f})"
+                if spread_pts > prof.max_spread_pts * 3: # Allow slightly wider tolerance for crypto volatility
+                    return f"ABORTED: SPREAD_TOO_WIDE ({spread_pts:.1f} pts)"
 
-                if action == "BUY": res = await connection.create_market_buy_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
-                else: res = await connection.create_market_sell_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
-                return f"SUCCESS [ID: {res.get('orderId', 'N/A')}]"
+                # Execute Market Order via MetaApi
+                if action == "BUY": 
+                    res = await connection.create_market_buy_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
+                else: 
+                    res = await connection.create_market_sell_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
+                
+                order_id = res.get('orderId') or res.get('stringCode') or 'OK'
+                return f"SUCCESS [ID: {order_id}]"
             except Exception as e:
-                if attempt == 3: return f"FAILED: {str(e)[:100]}"
+                err_msg = str(e)
+                log_event(logging.ERROR, "metaapi_exec_err", attempt=attempt, err=err_msg)
+                if attempt == 3: return f"FAILED: {err_msg[:120]}"
                 await asyncio.sleep(2 ** attempt)
-        return "FAILED: Max retries"
+        return "FAILED: Max retries exhausted"
 
     def execute_trade(self, symbol: str, action: str, levels: dict) -> str:
         if not self.enabled: return "DISABLED"
         try: return asyncio.run(self._execute(symbol, action, levels))
-        except Exception as e: return f"ERROR: {str(e)[:80]}"
+        except Exception as e: return f"ERROR: {str(e[:100])}"
 
 
 # ============================================================================
