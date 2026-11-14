@@ -1,10 +1,10 @@
 """
-XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.0 APEX ULTIMA
+XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.1 ULTIMA PROD
 ========================================================================
 Advanced Multi-Asset Quantitative Engine:
   - Multi-Symbol Looping (XAUUSD & BTCUSD) with Isolated Asset Profiles
+  - Robust SQLite WAL Auto-Migration & Safe Data Normalization Pipeline
   - Dynamic Session Breakout Boost & Adaptive Thresholding
-  - Institutional Risk Management, Kelly Criterion & WAL-Mode SQLite Audit
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "12.0-ULTIMA"
+VERSION = "12.1-ULTIMA-PROD"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -147,16 +147,6 @@ class BotConfig:
             db_path=os.getenv("AUDIT_DB_PATH", "data/quant_audit.db"),
         )
 
-    def warnings(self) -> List[str]:
-        w = []
-        if not self.twelve_data_api_key: w.append("TWELVE_DATA_API_KEY missing")
-        if not self.telegram_bot_token or not self.telegram_chat_id: w.append("Telegram creds missing")
-        if not SUPABASE.enabled: w.append("Supabase disabled")
-        if self.execute_trades:
-            if not self.metaapi_token: w.append("EXECUTE_TRADES=1 but METAAPI_TOKEN missing!")
-            else: w.append(f"⚡ MULTI-ASSET AUTO-EXECUTION ACTIVE for {self.symbols} on {self.mt5_server}.")
-        return w
-
 
 # ============================================================================
 # 2. LOGGING & UTILS
@@ -218,7 +208,7 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 4. SESSIONS & MARKET HOURS (ADAPTIVE PER ASSET)
+# 4. SESSIONS & MARKET HOURS
 # ============================================================================
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     weeks = calendar.monthcalendar(year, month)
@@ -239,8 +229,7 @@ def is_holiday(d: date) -> bool: return d in _HOLIDAYS.get(d.year, set())
 def is_market_open(symbol: str, now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     profile = ASSET_PROFILES.get(symbol)
-    if profile and profile.is_crypto:
-        return True # Crypto trades 24/7 without weekend closures
+    if profile and profile.is_crypto: return True
     if is_holiday(now.date()): return False
     wd, h = now.weekday(), now.hour
     if wd == 5: return False
@@ -260,7 +249,7 @@ def get_session_profile(symbol: str, cfg: BotConfig) -> Tuple[str, bool, float, 
 
 
 # ============================================================================
-# 5. DATA INGESTION (MULTI-SYMBOL SUPPORT)
+# 5. DATA INGESTION (SAFE NORMALIZATION PATCH)
 # ============================================================================
 def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
@@ -320,7 +309,7 @@ class MarketDataHandler:
                         df = df.rename(columns={tcol: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
                         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
                         for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-                        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+                        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
                         return df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
                     
                     h1 = norm(h1_raw)
@@ -342,7 +331,7 @@ class MarketDataHandler:
         df.columns = [c.strip().lower() for c in df.columns]
         df["time"] = pd.to_datetime(df["datetime"] if "datetime" in df.columns else df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
         h1 = df.dropna().sort_values("time").reset_index(drop=True)
         h4 = h1.set_index("time").resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna().reset_index()
         m15 = h1.set_index("time").resample("15min").ffill().reset_index()
@@ -360,29 +349,16 @@ class MarketDataHandler:
         df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
         return df.sort_values("time").reset_index(drop=True)
 
 
 # ============================================================================
-# 6. PARAMETERS & SIGNAL GENERATOR (APEX BREAKOUT BOOST)
+# 6. SIGNAL GENERATOR
 # ============================================================================
-DEFAULT_PARAMS = {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.5, "max_hold": 48.0}
-
-@dataclass
-class EnsembleResult:
-    action: str
-    total_score: float
-    voter_agreement: float
-    forensic_score: float
-    regime: str
-    poc_level: float
-    notes: List[str]
-    atr_value: float
-    atr_multiplier: float
-    threshold: float
-    skip_reason: Optional[str] = None
-
 class SignalGenerator:
     def __init__(self): pass
 
@@ -409,15 +385,8 @@ class SignalGenerator:
         atr_val = float(atr(df, 14).iloc[-1]); adx_val = float(adx(df, 14)[0].iloc[-1])
         weights = membership(adx_val); dom = dominant(weights)
         session, allowed, base_thresh, atr_mult = get_session_profile(symbol, cfg)
-        
-        # Adaptive Threshold Adjustment (Slightly relaxed during active sessions for higher reactivity)
         threshold = base_thresh - 3.0 if session in ("LONDON_TREND", "NY_OVERLAP") else base_thresh
 
-        # Stricter H4 Confluence Check
-        h4_close = h4["close"]
-        h4_bull = float(h4_close.iloc[-1]) > float(ema(h4_close, 50).iloc[-1])
-
-        # Forensic Score & Breakout Boost
         last, prev = df.iloc[-1], df.iloc[-21:-1]
         rng = max(last["high"] - last["low"], 0.01)
         wick_pct = (max(last["high"] - max(last["open"], last["close"]), min(last["open"], last["close"]) - last["low"]) / rng) * 100.0
@@ -446,9 +415,23 @@ class SignalGenerator:
             notes=notes, atr_value=round(atr_val, 4), atr_multiplier=atr_mult, threshold=threshold, skip_reason=skip_reason
         )
 
+@dataclass
+class EnsembleResult:
+    action: str
+    total_score: float
+    voter_agreement: float
+    forensic_score: float
+    regime: str
+    poc_level: float
+    notes: List[str]
+    atr_value: float
+    atr_multiplier: float
+    threshold: float
+    skip_reason: Optional[str] = None
+
 
 # ============================================================================
-# 7. AUDIT DATABASE (WAL MODE)
+# 7. AUDIT DATABASE (AUTO-MIGRATION PATCHED)
 # ============================================================================
 class AuditDB:
     def __init__(self, path: str):
@@ -463,9 +446,17 @@ class AuditDB:
                 self.conn.execute("""CREATE TABLE IF NOT EXISTS signals(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, ts TEXT, action TEXT, spot REAL, score REAL,
                     regime TEXT, kelly_pct REAL, lot REAL, risk REAL, status TEXT DEFAULT 'OPEN')""")
+                self._migrate()
             self.conn.commit()
             self.ok = True
         except Exception as e: log_event(logging.WARNING, "db_init_fail", err=str(e)[:80])
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(signals)").fetchall()}
+        if "symbol" not in cols:
+            try: self.conn.execute("ALTER TABLE signals ADD COLUMN symbol TEXT DEFAULT 'XAUUSD'")
+            except Exception: pass
+        self.conn.commit()
 
     def record(self, symbol: str, signal_id: str, e: EnsembleResult, spot: float, levels: dict) -> None:
         if not self.ok or not levels: return
@@ -489,16 +480,15 @@ class AuditDB:
 
 
 # ============================================================================
-# 8. RISK MANAGEMENT & METAAPI EXECUTION ENGINE
+# 8. RISK MANAGEMENT & EXECUTION ENGINE
 # ============================================================================
 class RiskManagementEngine:
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
+    def __init__(self, cfg: BotConfig): self.cfg = cfg
 
     def compute_levels(self, symbol: str, sig: str, entry: float, atr_v: float, atr_mult: float) -> Optional[dict]:
         if sig not in ("BUY", "SELL"): return None
         prof = ASSET_PROFILES.get(symbol, ASSET_PROFILES["XAUUSD"])
-        sl_d = max(atr_v * atr_mult, entry * 0.002) # Min stop loss buffer
+        sl_d = max(atr_v * atr_mult, entry * 0.002)
         risk_usd = self.cfg.account_size_usd * (self.cfg.risk_pct / 100.0)
         raw_lot = risk_usd / (sl_d * (100.0 if symbol == "XAUUSD" else 1.0))
         
@@ -539,9 +529,7 @@ class MetaApiExecutionEngine:
                 await connection.wait_synchronized()
                 
                 price_info = await connection.get_symbol_price(symbol)
-                ask = float(price_info.get("ask", 0))
-                bid = float(price_info.get("bid", 0))
-                spread_pts = abs(ask - bid)
+                spread_pts = abs(float(price_info.get("ask", 0)) - float(price_info.get("bid", 0)))
                 
                 if spread_pts > prof.max_spread_pts:
                     return f"ABORTED: SPREAD_TOO_WIDE ({spread_pts:.1f})"
@@ -561,7 +549,7 @@ class MetaApiExecutionEngine:
 
 
 # ============================================================================
-# 9. TELEGRAM NOTIFIER & ORCHESTRATOR
+# 9. ORCHESTRATOR & MAIN
 # ============================================================================
 class TelegramNotifier:
     def __init__(self, cfg: BotConfig): self.cfg = cfg
