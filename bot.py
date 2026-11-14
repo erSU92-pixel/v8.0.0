@@ -1,10 +1,11 @@
 """
-XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.3 APEX ADAPTIVE
+XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.5 APEX HYBRID
 ==========================================================================
-Dynamic Multi-Tier Adaptive Quantitative Engine:
-  - Automated Regime-Based Mode Switching (SNIPER, BALANCED, GROWTH)
-  - Multi-Timeframe Confluence Matrix (H4 + H1 + M15)
+Hybrid Confluence Quantitative Engine:
+  - Dynamic 3-Tier Adaptive Thresholds (Sniper, Balanced, Growth)
+  - Hybrid Multi-Timeframe Scoring Confluence (Bonus & Penalty System)
   - Robust SQLite WAL Auto-Migration & Fully Autonomous MetaApi Execution
+  - Transparent Real-Time Telegram Alerts & Risk Management
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "12.3-APEX-ADAPTIVE"
+VERSION = "12.5-APEX-HYBRID"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -140,7 +141,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info: p["exc"] = self.formatException(record.exc_info)
         return json.dumps(p, default=str)
 
-def get_logger(name: str = "apex-adaptive") -> logging.Logger:
+def get_logger(name: str = "apex-hybrid") -> logging.Logger:
     lg = logging.getLogger(name)
     if not lg.handlers:
         lg.setLevel(logging.INFO)
@@ -222,13 +223,12 @@ def get_adaptive_profile(symbol: str, adx_val: float) -> Tuple[str, str, float, 
     if not is_market_open(symbol, now): return "CLOSED", "OFFLINE", 999.0, 1.0
     
     h = now.hour
-    # Dynamic Tier Selection based on Market ADX & Session Liquidity
-    if adx_val > 25.0 and h in range(7, 17):
-        return "GROWTH", "TREND_RIDER", 63.5, 1.6  # Growth mode: Agile & Trend-focused
-    elif adx_val < 18.0 or h in range(0, 7):
-        return "SNIPER", "CONSERVATIVE", 71.0, 1.2 # Sniper mode: Ultra strict defense
+    if adx_val > 22.0 and h in range(7, 17):
+        return "GROWTH", "TREND_RIDER", 64.0, 1.5
+    elif adx_val < 15.0 or h in range(0, 7):
+        return "SNIPER", "CONSERVATIVE", 68.5, 1.2
     else:
-        return "BALANCED", "SWEET_SPOT", 66.5, 1.4 # Balanced mode: Institutional standard
+        return "BALANCED", "SWEET_SPOT", 65.5, 1.35
 
 
 # ============================================================================
@@ -256,12 +256,11 @@ class MarketDataHandler:
         self.session = requests.Session()
         r = Retry(total=cfg.retry_total, backoff_factor=cfg.retry_backoff, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
         self.session.mount("https://", HTTPAdapter(max_retries=r))
-        self.session.headers.update({"User-Agent": f"ApexAdaptive/{VERSION}"})
+        self.session.headers.update({"User-Agent": f"ApexHybrid/{VERSION}"})
 
     def fetch(self, symbol: str) -> MarketData:
         prof = ASSET_PROFILES.get(symbol, ASSET_PROFILES["XAUUSD"])
         
-        # 1. Try TwelveData
         if self.cfg.twelve_data_api_key:
             try:
                 h1 = self._twelve(prof.twelve_symbol, "1h", 500)
@@ -278,7 +277,6 @@ class MarketDataHandler:
             except Exception as e:
                 log_event(logging.WARNING, "twelvedata_fail", symbol=symbol, err=str(e)[:100])
 
-        # 2. Try Yahoo Finance
         if yf is not None:
             try:
                 tk = yf.Ticker(prof.yf_ticker)
@@ -303,7 +301,6 @@ class MarketDataHandler:
             except Exception as e:
                 log_event(logging.WARNING, "yfinance_fail", symbol=symbol, err=str(e)[:100])
 
-        # 3. Fallback CSV
         csv_path = os.path.join(self.cfg.csv_dir, f"{symbol.lower()}_h1.csv")
         if not (os.path.exists(csv_path) and os.path.getsize(csv_path) > 0):
             os.makedirs(self.cfg.csv_dir, exist_ok=True)
@@ -337,7 +334,7 @@ class MarketDataHandler:
 
 
 # ============================================================================
-# 6. ADAPTIVE SIGNAL GENERATOR
+# 6. HYBRID CONFLUENCE SIGNAL GENERATOR
 # ============================================================================
 class SignalGenerator:
     def __init__(self): pass
@@ -351,7 +348,7 @@ class SignalGenerator:
         r = float(rsi(close, 14).iloc[-1])
         v.extend([1 if r > 50 else -1, 1 if r < 75 else -1, 1 if r > 25 else -1])
         adx_v, p_di, m_di = adx(df, 14)
-        v.extend([1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_v.iloc[-1] > 20 else -1,
+        v.extend([1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_v.iloc[-1] > 18 else -1,
                   1 if c > close.iloc[-2] else -1, 1 if c > close.iloc[-5] else -1, 1 if c > close.iloc[-10] else -1])
         v.append(1 if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1] else -1)
         poc = volume_profile_poc(df)
@@ -365,7 +362,6 @@ class SignalGenerator:
         atr_val = float(atr(df, 14).iloc[-1])
         adx_val = float(adx(df, 14)[0].iloc[-1])
         
-        # Determine Adaptive Mode & Threshold dynamically
         mode, profile_desc, threshold, atr_mult = get_adaptive_profile(symbol, adx_val)
         if mode == "CLOSED":
             return EnsembleResult(action="WAIT", total_score=0.0, voter_agreement=0.0, forensic_score=0.0, regime="CLOSED", poc_level=0.0, notes=["Market Closed"], atr_value=atr_val, atr_multiplier=1.0, threshold=999.0, skip_reason="CLOSED")
@@ -380,26 +376,53 @@ class SignalGenerator:
         last = df.iloc[-1]
         rng = max(last["high"] - last["low"], 0.01)
         body_pct = abs(last["close"] - last["open"]) / rng * 100.0
-        vol_spike = last["volume"] > df["volume"].rolling(20).mean().iloc[-1] * 1.1
+        vol_spike = last["volume"] > df["volume"].rolling(20).mean().iloc[-1] * 1.05
 
         f_score = 50.0
-        if body_pct > 35.0: f_score += 25.0
+        if body_pct > 30.0: f_score += 25.0
         if vol_spike: f_score += 25.0
         f_score = min(f_score, 100.0)
 
         voter_agree, bull, bear = self._run_voters(df)
-        combined = round((voter_agree * 0.55 + (f_score / 100.0) * 0.45) * 100, 1)
+        base_score = (voter_agree * 0.55 + (f_score / 100.0) * 0.45) * 100.0
         intended = "BUY" if bull > bear else "SELL"
 
-        notes, action, skip_reason = [f"MODE: {mode} ({profile_desc})"], "WAIT", None
-        if not news.allowed: notes.append(f"NEWS: {news.reason}"); skip_reason = "NEWS"
-        elif combined < threshold: notes.append(f"ADAPTIVE GATE: {combined}% < {threshold}%"); skip_reason = "GATE"
-        elif intended == "BUY" and (h4_bull or m15_bull):
-            action = "BUY"; notes.append(f"ADAPTIVE BUY OK [Score: {combined}%]")
-        elif intended == "SELL" and (not h4_bull or not m15_bull):
-            action = "SELL"; notes.append(f"ADAPTIVE SELL OK [Score: {combined}%]")
+        notes = [f"MODE: {mode} ({profile_desc})"]
+
+        # Hybrid Confluence Scoring Adjustment (Bonus & Penalty Engine)
+        if intended == "BUY":
+            if h4_bull and m15_bull:
+                confluence_adj = 8.0
+                notes.append("Full Bullish Confluence (+8.0% Bonus)")
+            elif h4_bull or m15_bull:
+                confluence_adj = 0.0
+                notes.append("Partial Bullish Alignment (Neutral)")
+            else:
+                confluence_adj = -12.0
+                notes.append("Bearish Timeframe Divergence (-12.0% Penalty)")
         else:
-            notes.append("Momentum alignment unconfirmed"); skip_reason = "MOMENTUM"
+            if not h4_bull and not m15_bull:
+                confluence_adj = 8.0
+                notes.append("Full Bearish Confluence (+8.0% Bonus)")
+            elif not h4_bull or not m15_bull:
+                confluence_adj = 0.0
+                notes.append("Partial Bearish Alignment (Neutral)")
+            else:
+                confluence_adj = -12.0
+                notes.append("Bullish Timeframe Divergence (-12.0% Penalty)")
+
+        combined = round(min(max(base_score + confluence_adj, 0.0), 100.0), 1)
+
+        action, skip_reason = "WAIT", None
+        if not news.allowed:
+            notes.append(f"NEWS: {news.reason}")
+            skip_reason = "NEWS"
+        elif combined < threshold:
+            notes.append(f"HYBRID GATE: {combined}% < {threshold}%")
+            skip_reason = "GATE"
+        else:
+            action = intended
+            notes.append(f"HYBRID {intended} APPROVED [Score: {combined}% >= {threshold}%]")
 
         return EnsembleResult(
             action=action, total_score=combined, voter_agreement=round(voter_agree, 4),
@@ -556,11 +579,11 @@ class TelegramNotifier:
         if not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id): return False
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         em = "🟢" if e.action == "BUY" else ("🔴" if e.action == "SELL" else "🟡")
-        text = f"{em} <b>{symbol} v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> (Threshold: {e.threshold}%)\nRegime: {e.regime}\nPOC: ${e.poc_level:.2f}\n"
+        text = f"{em} <b>{symbol} v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nHybrid Score: <b>{e.total_score}%</b> (Thresh: {e.threshold}%)\nRegime: {e.regime}\nPOC: ${e.poc_level:.2f}\n"
         if levels and not levels.get("skip"):
             text += f"<code>ENTRY : ${levels['entry_price']}\nSL    : ${levels['sl_price']}\nTP2   : ${levels['tp2_price']}</code>\nLot: <b>{levels['lot_size']}</b> | Risk: ${levels['risk_amount_usd']}\n⚡ <i>{exec_status or 'MANUAL'}</i>"
         else:
-            text += f"Reason: {e.notes[0] if e.notes else 'Waiting for adaptive trigger'}"
+            text += f"Note: {e.notes[1] if len(e.notes) > 1 else e.notes[0]}"
 
         url = f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage"
         try:
@@ -607,7 +630,7 @@ class TradingBotOrchestrator:
                         exec_status = self.executor.execute_trade(symbol, e.action, levels)
 
                 self.tg.send_signal(symbol, e, spot, levels, exec_status)
-                print(f"[{symbol}] ACTION: {e.action} | Score: {e.total_score}% (Thresh: {e.threshold}%) | Spot: {spot}")
+                print(f"[{symbol}] ACTION: {e.action} | Hybrid Score: {e.total_score}% (Thresh: {e.threshold}%) | Spot: {spot}")
             except Exception as ex:
                 log_event(logging.ERROR, "symbol_loop_fail", symbol=symbol, err=str(ex)[:150])
         return 0
