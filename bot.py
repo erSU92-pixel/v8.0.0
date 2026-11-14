@@ -1,10 +1,10 @@
 """
-XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.1 ULTIMA PROD
-========================================================================
-Advanced Multi-Asset Quantitative Engine:
-  - Multi-Symbol Looping (XAUUSD & BTCUSD) with Isolated Asset Profiles
-  - Robust SQLite WAL Auto-Migration & Safe Data Normalization Pipeline
-  - Dynamic Session Breakout Boost & Adaptive Thresholding
+XAUUSD & BTCUSD Quantitative Institutional Signal Bot — v12.3 APEX ADAPTIVE
+==========================================================================
+Dynamic Multi-Tier Adaptive Quantitative Engine:
+  - Automated Regime-Based Mode Switching (SNIPER, BALANCED, GROWTH)
+  - Multi-Timeframe Confluence Matrix (H4 + H1 + M15)
+  - Robust SQLite WAL Auto-Migration & Fully Autonomous MetaApi Execution
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "12.1-ULTIMA-PROD"
+VERSION = "12.3-APEX-ADAPTIVE"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -91,10 +91,6 @@ class BotConfig:
     macro_cache_min: int = 30
     news_enabled: bool = True
     
-    notify_wait: bool = False
-    notify_skip: bool = False
-    notify_halt: bool = False
-
     execute_trades: bool = False
     metaapi_token: Optional[str] = None
     mt5_login: Optional[str] = None
@@ -102,18 +98,6 @@ class BotConfig:
     mt5_server: Optional[str] = None
     symbols: List[str] = field(default_factory=lambda: ["XAUUSD", "BTCUSD"])
 
-    max_stale_h_market: float = 1.5
-    max_stale_h_off: float = 72.0
-    dxy_warn: float = 0.3
-    dxy_veto: float = 0.6
-    dxy_halt: float = 1.2
-    max_tp2_atr_mult: float = 4.0
-    
-    daily_dd_limit_r: float = 2.0
-    daily_dd_derisk_r: float = 1.0
-    daily_dd_derisk_mult: float = 0.5
-    cb_halt_consecutive: int = 3
-    
     twelve_data_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
@@ -129,10 +113,6 @@ class BotConfig:
             risk_pct=float(os.getenv("RISK_PCT", "1.0")),
             max_lot_risk_pct=float(os.getenv("MAX_LOT_RISK_PCT", "2.5")),
             news_enabled=os.getenv("NEWS_ENABLED", "1") == "1",
-            
-            notify_wait=os.getenv("NOTIFY_WAIT", "0") == "1",
-            notify_skip=os.getenv("NOTIFY_SKIP", "0") == "1",
-            notify_halt=os.getenv("NOTIFY_HALT", "0") == "1",
 
             execute_trades=os.getenv("EXECUTE_TRADES", "0") == "1",
             metaapi_token=os.getenv("METAAPI_TOKEN"),
@@ -160,7 +140,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info: p["exc"] = self.formatException(record.exc_info)
         return json.dumps(p, default=str)
 
-def get_logger(name: str = "apex-ultima") -> logging.Logger:
+def get_logger(name: str = "apex-adaptive") -> logging.Logger:
     lg = logging.getLogger(name)
     if not lg.handlers:
         lg.setLevel(logging.INFO)
@@ -208,7 +188,7 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 4. SESSIONS & MARKET HOURS
+# 4. SESSIONS & ADAPTIVE MULTI-TIER ENGINE
 # ============================================================================
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     weeks = calendar.monthcalendar(year, month)
@@ -237,19 +217,22 @@ def is_market_open(symbol: str, now: Optional[datetime] = None) -> bool:
     if wd == 4: return h < 21
     return True
 
-def get_session_profile(symbol: str, cfg: BotConfig) -> Tuple[str, bool, float, float]:
+def get_adaptive_profile(symbol: str, adx_val: float) -> Tuple[str, str, float, float]:
     now = datetime.now(timezone.utc)
-    if not is_market_open(symbol, now): return "CLOSED", False, 999.0, 1.0
+    if not is_market_open(symbol, now): return "CLOSED", "OFFLINE", 999.0, 1.0
+    
     h = now.hour
-    if 0 <= h < 7:   return "ASIA_RANGE",   True, 65.0, 1.0
-    if 7 <= h < 12:  return "LONDON_TREND", True, 68.0, 1.3
-    if 12 <= h < 16: return "NY_OVERLAP",   True, 72.0, 1.5
-    if 16 <= h < 21: return "NY_PM",        True, 68.0, 1.3
-    return "OFF_HOURS", False, 999.0, 1.0
+    # Dynamic Tier Selection based on Market ADX & Session Liquidity
+    if adx_val > 25.0 and h in range(7, 17):
+        return "GROWTH", "TREND_RIDER", 63.5, 1.6  # Growth mode: Agile & Trend-focused
+    elif adx_val < 18.0 or h in range(0, 7):
+        return "SNIPER", "CONSERVATIVE", 71.0, 1.2 # Sniper mode: Ultra strict defense
+    else:
+        return "BALANCED", "SWEET_SPOT", 66.5, 1.4 # Balanced mode: Institutional standard
 
 
 # ============================================================================
-# 5. DATA INGESTION (SAFE NORMALIZATION PATCH)
+# 5. DATA INGESTION
 # ============================================================================
 def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str) -> None:
     req = {"time", "open", "high", "low", "close", "volume"}
@@ -273,7 +256,7 @@ class MarketDataHandler:
         self.session = requests.Session()
         r = Retry(total=cfg.retry_total, backoff_factor=cfg.retry_backoff, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
         self.session.mount("https://", HTTPAdapter(max_retries=r))
-        self.session.headers.update({"User-Agent": f"ApexUltima/{VERSION}"})
+        self.session.headers.update({"User-Agent": f"ApexAdaptive/{VERSION}"})
 
     def fetch(self, symbol: str) -> MarketData:
         prof = ASSET_PROFILES.get(symbol, ASSET_PROFILES["XAUUSD"])
@@ -349,15 +332,12 @@ class MarketDataHandler:
         df = pd.DataFrame(vals).rename(columns={"datetime": "time"})
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]: df[c] = pd.to_numeric(df[c], errors="coerce")
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
-        else:
-            df["volume"] = 1000.0
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
         return df.sort_values("time").reset_index(drop=True)
 
 
 # ============================================================================
-# 6. SIGNAL GENERATOR
+# 6. ADAPTIVE SIGNAL GENERATOR
 # ============================================================================
 class SignalGenerator:
     def __init__(self): pass
@@ -369,7 +349,7 @@ class SignalGenerator:
                   1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1,
                   1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1])
         r = float(rsi(close, 14).iloc[-1])
-        v.extend([1 if r > 50 else -1, 1 if r < 70 else -1, 1 if r > 30 else -1])
+        v.extend([1 if r > 50 else -1, 1 if r < 75 else -1, 1 if r > 25 else -1])
         adx_v, p_di, m_di = adx(df, 14)
         v.extend([1 if p_di.iloc[-1] > m_di.iloc[-1] else -1, 1 if adx_v.iloc[-1] > 20 else -1,
                   1 if c > close.iloc[-2] else -1, 1 if c > close.iloc[-5] else -1, 1 if c > close.iloc[-10] else -1])
@@ -381,33 +361,45 @@ class SignalGenerator:
 
     def generate(self, md: MarketData, symbol: str, news: NewsResult, cfg: BotConfig) -> EnsembleResult:
         df, h4, m15 = md.h1, md.h4, md.m15
-        close = df["close"]; c_last = float(close.iloc[-1])
-        atr_val = float(atr(df, 14).iloc[-1]); adx_val = float(adx(df, 14)[0].iloc[-1])
-        weights = membership(adx_val); dom = dominant(weights)
-        session, allowed, base_thresh, atr_mult = get_session_profile(symbol, cfg)
-        threshold = base_thresh - 3.0 if session in ("LONDON_TREND", "NY_OVERLAP") else base_thresh
-
-        last, prev = df.iloc[-1], df.iloc[-21:-1]
-        rng = max(last["high"] - last["low"], 0.01)
-        wick_pct = (max(last["high"] - max(last["open"], last["close"]), min(last["open"], last["close"]) - last["low"]) / rng) * 100.0
+        close = df["close"]
+        atr_val = float(atr(df, 14).iloc[-1])
+        adx_val = float(adx(df, 14)[0].iloc[-1])
         
-        f_score = 40.0
-        if wick_pct > 35.0: f_score += 25.0
-        if last["volume"] > df["volume"].rolling(20).mean().iloc[-1] * 1.3: f_score += 25.0
+        # Determine Adaptive Mode & Threshold dynamically
+        mode, profile_desc, threshold, atr_mult = get_adaptive_profile(symbol, adx_val)
+        if mode == "CLOSED":
+            return EnsembleResult(action="WAIT", total_score=0.0, voter_agreement=0.0, forensic_score=0.0, regime="CLOSED", poc_level=0.0, notes=["Market Closed"], atr_value=atr_val, atr_multiplier=1.0, threshold=999.0, skip_reason="CLOSED")
+
+        weights = membership(adx_val)
+        dom = dominant(weights)
+
+        h4_close = h4["close"]
+        h4_bull = float(h4_close.iloc[-1]) > float(ema(h4_close, 50).iloc[-1])
+        m15_bull = float(ema(m15["close"], 9).iloc[-1]) > float(ema(m15["close"], 21).iloc[-1])
+
+        last = df.iloc[-1]
+        rng = max(last["high"] - last["low"], 0.01)
+        body_pct = abs(last["close"] - last["open"]) / rng * 100.0
+        vol_spike = last["volume"] > df["volume"].rolling(20).mean().iloc[-1] * 1.1
+
+        f_score = 50.0
+        if body_pct > 35.0: f_score += 25.0
+        if vol_spike: f_score += 25.0
         f_score = min(f_score, 100.0)
 
         voter_agree, bull, bear = self._run_voters(df)
-        combined = round((voter_agree * 0.50 + (f_score / 100.0) * 0.50) * 100, 1)
+        combined = round((voter_agree * 0.55 + (f_score / 100.0) * 0.45) * 100, 1)
         intended = "BUY" if bull > bear else "SELL"
-        m15_bull = ema(m15["close"], 9).iloc[-1] > ema(m15["close"], 21).iloc[-1]
 
-        notes, action, skip_reason = [], "WAIT", None
+        notes, action, skip_reason = [f"MODE: {mode} ({profile_desc})"], "WAIT", None
         if not news.allowed: notes.append(f"NEWS: {news.reason}"); skip_reason = "NEWS"
-        elif not allowed: notes.append(f"SESSION: {session}"); skip_reason = "SESSION"
-        elif combined < threshold: notes.append(f"GATED[{dom}]: {combined}% < {threshold}%"); skip_reason = "GATE"
-        elif intended == "BUY" and m15_bull: action = "BUY"; notes.append(f"APEX OK[{dom}] {combined}%")
-        elif intended == "SELL" and not m15_bull: action = "SELL"; notes.append(f"APEX OK[{dom}] {combined}%")
-        else: notes.append("M15 misaligned"); skip_reason = "M15"
+        elif combined < threshold: notes.append(f"ADAPTIVE GATE: {combined}% < {threshold}%"); skip_reason = "GATE"
+        elif intended == "BUY" and (h4_bull or m15_bull):
+            action = "BUY"; notes.append(f"ADAPTIVE BUY OK [Score: {combined}%]")
+        elif intended == "SELL" and (not h4_bull or not m15_bull):
+            action = "SELL"; notes.append(f"ADAPTIVE SELL OK [Score: {combined}%]")
+        else:
+            notes.append("Momentum alignment unconfirmed"); skip_reason = "MOMENTUM"
 
         return EnsembleResult(
             action=action, total_score=combined, voter_agreement=round(voter_agree, 4),
@@ -431,7 +423,7 @@ class EnsembleResult:
 
 
 # ============================================================================
-# 7. AUDIT DATABASE (AUTO-MIGRATION PATCHED)
+# 7. AUDIT DATABASE (WAL MODE)
 # ============================================================================
 class AuditDB:
     def __init__(self, path: str):
@@ -480,7 +472,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 8. RISK MANAGEMENT & ENHANCED METAAPI EXECUTION ENGINE
+# 8. RISK MANAGEMENT & METAAPI EXECUTION ENGINE
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig): self.cfg = cfg
@@ -523,28 +515,21 @@ class MetaApiExecutionEngine:
                 async for acc in accounts:
                     if str(acc.login) == str(self.cfg.mt5_login): account = acc; break
                 
-                if not account:
-                    return f"FAILED: Account login {self.cfg.mt5_login} not found on MetaApi"
+                if not account: return f"FAILED: Account login {self.cfg.mt5_login} not found"
 
                 await account.wait_connected(timeout_in_seconds=60)
                 connection = account.get_rpc_connection()
                 await connection.connect()
                 await connection.wait_synchronized()
                 
-                # Check symbol pricing & spread
                 price_info = await connection.get_symbol_price(symbol)
-                ask = float(price_info.get("ask", 0))
-                bid = float(price_info.get("bid", 0))
-                spread_pts = abs(ask - bid)
+                spread_pts = abs(float(price_info.get("ask", 0)) - float(price_info.get("bid", 0)))
                 
-                if spread_pts > prof.max_spread_pts * 3: # Allow slightly wider tolerance for crypto volatility
+                if spread_pts > prof.max_spread_pts * 3:
                     return f"ABORTED: SPREAD_TOO_WIDE ({spread_pts:.1f} pts)"
 
-                # Execute Market Order via MetaApi
-                if action == "BUY": 
-                    res = await connection.create_market_buy_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
-                else: 
-                    res = await connection.create_market_sell_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
+                if action == "BUY": res = await connection.create_market_buy_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
+                else: res = await connection.create_market_sell_order(symbol, levels["lot_size"], levels["sl_price"], levels["tp2_price"])
                 
                 order_id = res.get('orderId') or res.get('stringCode') or 'OK'
                 return f"SUCCESS [ID: {order_id}]"
@@ -571,11 +556,11 @@ class TelegramNotifier:
         if not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id): return False
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         em = "🟢" if e.action == "BUY" else ("🔴" if e.action == "SELL" else "🟡")
-        text = f"{em} <b>{symbol} v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> (Forensic: {e.forensic_score}%)\nRegime: {e.regime}\nPOC: ${e.poc_level:.2f}\n"
+        text = f"{em} <b>{symbol} v{VERSION} — {e.action}</b>\n⏰ <code>{now}</code>\n───────────────────\nScore: <b>{e.total_score}%</b> (Threshold: {e.threshold}%)\nRegime: {e.regime}\nPOC: ${e.poc_level:.2f}\n"
         if levels and not levels.get("skip"):
             text += f"<code>ENTRY : ${levels['entry_price']}\nSL    : ${levels['sl_price']}\nTP2   : ${levels['tp2_price']}</code>\nLot: <b>{levels['lot_size']}</b> | Risk: ${levels['risk_amount_usd']}\n⚡ <i>{exec_status or 'MANUAL'}</i>"
         else:
-            text += f"Reason: {e.notes[0] if e.notes else 'Waiting for momentum'}"
+            text += f"Reason: {e.notes[0] if e.notes else 'Waiting for adaptive trigger'}"
 
         url = f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}/sendMessage"
         try:
@@ -622,7 +607,7 @@ class TradingBotOrchestrator:
                         exec_status = self.executor.execute_trade(symbol, e.action, levels)
 
                 self.tg.send_signal(symbol, e, spot, levels, exec_status)
-                print(f"[{symbol}] ACTION: {e.action} | Score: {e.total_score}% | Spot: {spot}")
+                print(f"[{symbol}] ACTION: {e.action} | Score: {e.total_score}% (Thresh: {e.threshold}%) | Spot: {spot}")
             except Exception as ex:
                 log_event(logging.ERROR, "symbol_loop_fail", symbol=symbol, err=str(ex)[:150])
         return 0
